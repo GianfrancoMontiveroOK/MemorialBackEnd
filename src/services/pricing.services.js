@@ -2,22 +2,66 @@
 
 import Cliente from "../models/client.model.js";
 import { getGlobalPriceRules } from "./priceRules.provider.js";
-import { computeCuotaIdealWith } from "./pricing.engine.js";
 
-/* ===================== Helpers ===================== */
+/* ============================================================================
+   ENGINE — helpers puros + cálculo de cuota
+   ========================================================================== */
 
-function ageFromDate(d) {
-  if (!d) return undefined;
-  const dt = d instanceof Date ? d : new Date(d);
-  if (Number.isNaN(dt.getTime())) return undefined;
-  const today = new Date();
-  let a = today.getFullYear() - dt.getFullYear();
-  const m = today.getMonth() - dt.getMonth();
-  if (m < 0 || (m === 0 && today.getDate() < dt.getDate())) a--;
-  return a >= 0 ? a : undefined;
+export function round500(x) {
+  const n = Number(x) || 0;
+  const base = Math.floor(n / 500) * 500;
+  return n - base >= 250 ? base + 500 : base;
 }
 
-// Inactivo solo si baja es Date válido o activo es falso explícito
+export function membersFactor(n, groupCfg) {
+  const m = Math.max(1, Number(n) || 1);
+  const { neutralAt = 4, step = 0.25, minMap = {} } = groupCfg || {};
+  if (minMap[m] != null) return Number(minMap[m]);
+  if (m <= neutralAt) {
+    if (m === 1) return 0.5;
+    if (m === 2) return 0.75;
+    return 1.0; // 3 y 4 → 1.0
+  }
+  return 1 + step * (m - neutralAt);
+}
+
+export function ageCoef(edadMax, tiers) {
+  const e = Number(edadMax) || 0;
+  for (const t of tiers || []) {
+    if (e >= (t?.min ?? 0)) return Number(t?.coef || 1);
+  }
+  return 1.0;
+}
+
+export function computeCuotaIdealWith(
+  { base, integrantes, edadMax, cremCount },
+  rules
+) {
+  const B = Number(base ?? rules.base);
+  const g = membersFactor(integrantes, rules.group);
+  const a = ageCoef(edadMax, rules.age);
+  const crem =
+    B * Number(rules.cremationCoef) * Math.max(0, Number(cremCount) || 0);
+  return round500(B * g * a + crem);
+}
+
+export async function computeCuotaIdealAsync({
+  base,
+  integrantes,
+  edadMax,
+  cremCount,
+}) {
+  const rules = await getGlobalPriceRules();
+  return computeCuotaIdealWith(
+    { base, integrantes, edadMax, cremCount },
+    rules
+  );
+}
+
+/* ============================================================================
+   HELPERS DB
+   ========================================================================== */
+
 function isActive(member) {
   if (member?.baja) {
     const d = new Date(member.baja);
@@ -34,7 +78,6 @@ function isActive(member) {
   return true;
 }
 
-// Filtro robusto por idCliente (num o string de mismo valor)
 function buildGroupFilter(idKey) {
   const t = String(idKey).trim();
   const n = Number(t);
@@ -46,20 +89,154 @@ function buildGroupFilter(idKey) {
   return { $or: or };
 }
 
-/* ========================================================================
-   1) Núcleo: recalcular 'cuotaIdeal' de TODO el grupo (nuevo modelo)
-      - Integrantes activos = count de miembros activos
-      - edadMax = máximo de edades válidas de activos
-      - cremaciones = count de activos con { cremacion: true }
-      - Reglas SIEMPRE desde Settings (getGlobalPriceRules)
-      - Nota: el parámetro 'base' se ignora (compat con llamadas viejas)
-   ======================================================================== */
+/** Recalcula y PERSISTE `edad` para el grupo (usa fechaNac || fechNacimiento). */
+async function updateAgesForGroup(filter, { debug = false } = {}) {
+  const now = new Date();
+  const res = await Cliente.updateMany(
+    filter,
+    [
+      { $set: { _dobRaw: { $ifNull: ["$fechaNac", "$fechNacimiento"] } } },
+      {
+        $set: {
+          _dob: {
+            $switch: {
+              branches: [
+                {
+                  case: { $eq: [{ $type: "$_dobRaw" }, "date"] },
+                  then: "$_dobRaw",
+                },
+                {
+                  case: {
+                    $and: [
+                      { $eq: [{ $type: "$_dobRaw" }, "string"] },
+                      {
+                        $regexMatch: {
+                          input: "$_dobRaw",
+                          regex: "^\\d{1,2}/\\d{1,2}/\\d{2,4}$",
+                        },
+                      },
+                    ],
+                  },
+                  then: {
+                    $let: {
+                      vars: {
+                        yyyy: {
+                          $cond: [
+                            {
+                              $gte: [
+                                {
+                                  $strLenCP: {
+                                    $toString: {
+                                      $arrayElemAt: [
+                                        { $split: ["$_dobRaw", "/"] },
+                                        2,
+                                      ],
+                                    },
+                                  },
+                                },
+                                4,
+                              ],
+                            },
+                            {
+                              $dateFromString: {
+                                dateString: "$_dobRaw",
+                                format: "%d/%m/%Y",
+                              },
+                            },
+                            {
+                              $dateFromString: {
+                                dateString: "$_dobRaw",
+                                format: "%d/%m/%y",
+                              },
+                            },
+                          ],
+                        },
+                      },
+                      in: "$$yyyy",
+                    },
+                  },
+                },
+              ],
+              default: {
+                $convert: {
+                  input: "$_dobRaw",
+                  to: "date",
+                  onError: null,
+                  onNull: null,
+                },
+              },
+            },
+          },
+        },
+      },
+      {
+        $set: {
+          edad: {
+            $let: {
+              vars: {
+                years: {
+                  $cond: [
+                    { $ne: ["$_dob", null] },
+                    {
+                      $dateDiff: {
+                        startDate: "$_dob",
+                        endDate: now,
+                        unit: "year",
+                      },
+                    },
+                    null,
+                  ],
+                },
+              },
+              in: {
+                $cond: [
+                  {
+                    $and: [
+                      { $ne: ["$$years", null] },
+                      { $gte: ["$$years", 0] },
+                      { $lte: ["$$years", 120] },
+                    ],
+                  },
+                  "$$years",
+                  null,
+                ],
+              },
+            },
+          },
+        },
+      },
+      { $unset: ["_dobRaw", "_dob"] },
+    ],
+    { strict: false } // por si el schema no tiene alguno de los campos legacy
+  );
+
+  if (debug) {
+    console.log(
+      `[AGE-UPDATE group] matched=${res?.matchedCount ?? 0}, modified=${
+        res?.modifiedCount ?? 0
+      }`
+    );
+  }
+  return res;
+}
+
+/* ============================================================================
+   1) Núcleo: recalcular y PERSISTIR todo el grupo
+   - Recalcula EDADES por miembro (persistente)
+   - Ignora inactivos para el cómputo (baja válida o activo=false)
+   - Calcula integrantes, edadMax, cremaciones, cuotaIdeal
+   - Persiste cuotaIdeal + edadMaxPoliza en TODO el grupo (y titular)
+   ========================================================================== */
 export async function recomputeGroupPricing(
   idClienteKey,
   { debug = false } = {}
 ) {
   const filter = buildGroupFilter(idClienteKey);
 
+  // 0) Aseguramos EDADES actualizadas y persistidas
+  await updateAgesForGroup(filter, { debug });
+
+  // 1) Leemos miembros del grupo (ahora con edad recalculada)
   const members = await Cliente.aggregate([
     { $match: filter },
     {
@@ -68,9 +245,9 @@ export async function recomputeGroupPricing(
         idCliente: 1,
         activo: 1,
         baja: 1,
-        fechaNac: 1,
         edad: 1,
-        cremacion: 1, // boolean nuevo
+        fechaNac: 1,
+        cremacion: 1,
         rol: 1,
       },
     },
@@ -80,14 +257,21 @@ export async function recomputeGroupPricing(
   const activosArr = members.filter(isActive);
   const integrantes = activosArr.length;
 
+  // edadMax: priorizamos `edad` ya recalculada; fallback a fechaNac por seguridad
   const edades = activosArr
     .map((m) => {
-      const a = ageFromDate(m.fechaNac);
-      return typeof a === "number"
-        ? a
-        : typeof m.edad === "number"
-        ? m.edad
-        : undefined;
+      if (typeof m?.edad === "number") return m.edad;
+      if (m?.fechaNac) {
+        const dt = new Date(m.fechaNac);
+        if (!Number.isNaN(dt.getTime())) {
+          const today = new Date();
+          let a = today.getFullYear() - dt.getFullYear();
+          const mm = today.getMonth() - dt.getMonth();
+          if (mm < 0 || (mm === 0 && today.getDate() < dt.getDate())) a--;
+          return a >= 0 && a <= 120 ? a : undefined;
+        }
+      }
+      return undefined;
     })
     .filter((a) => typeof a === "number");
 
@@ -97,10 +281,9 @@ export async function recomputeGroupPricing(
     0
   );
 
-  // Reglas dinámicas desde Settings
+  // 2) Reglas → cuotaIdeal (para el grupo)
   const rules = await getGlobalPriceRules();
   const BASE = Number(rules.base ?? 16000);
-
   const cuotaIdeal =
     integrantes > 0
       ? computeCuotaIdealWith(
@@ -109,28 +292,24 @@ export async function recomputeGroupPricing(
         )
       : 0;
 
-  // 1) Actualizar cuotaIdeal en TODO el grupo
-  const res = await Cliente.updateMany(filter, {
-    $set: { cuotaIdeal, updatedAt: new Date() },
-  });
+  // 3) Persistimos en TODO el grupo (denormalización útil de lectura)
+  const res = await Cliente.updateMany(
+    filter,
+    { $set: { cuotaIdeal, edadMaxPoliza: edadMax, updatedAt: new Date() } },
+    { strict: false }
+  );
   const matched = res?.matchedCount ?? 0;
   const modified = res?.modifiedCount ?? 0;
 
-  // 2) Actualizar edadMaxPoliza del TITULAR (fallback: todo el grupo si no hay titular)
+  // 4) Redundancia explícita en titular (por si querés consultar solo titulares)
   const titularFilter = { $and: [filter, { rol: "TITULAR" }] };
-  const updTitular = await Cliente.updateMany(titularFilter, {
-    $set: { edadMaxPoliza: edadMax, updatedAt: new Date() },
-  });
-
+  const updTitular = await Cliente.updateMany(
+    titularFilter,
+    { $set: { edadMaxPoliza: edadMax, updatedAt: new Date() } },
+    { strict: false }
+  );
   const titularMatched = updTitular?.matchedCount ?? 0;
   const titularModified = updTitular?.modifiedCount ?? 0;
-
-  if (titularMatched === 0) {
-    // No hay titular explícito → escribimos edadMaxPoliza en todos para consistencia
-    await Cliente.updateMany(filter, {
-      $set: { edadMaxPoliza: edadMax, updatedAt: new Date() },
-    });
-  }
 
   if (debug) {
     console.log("[pricing] grupo:", idClienteKey, {
@@ -161,12 +340,9 @@ export async function recomputeGroupPricing(
   };
 }
 
-/* ========================================================================
-   2) Orquestador: recalcular por lote de grupos (ids)
-      - Con barra de progreso (TTY) o logs periódicos
-      - Solo usa PRICING_MODE=prueba para activar debug verboso
-      - NO usa PRICING_BASE ni otras .env de pricing
-   ======================================================================== */
+/* ============================================================================
+   2) Orquestador: por lote de grupos
+   ========================================================================== */
 export async function recomputeGroupsByIds(
   ids = [],
   {
@@ -264,11 +440,9 @@ export async function recomputeGroupsByIds(
   return { ok: true, total, procesados, matchedTotal, modifiedTotal, errores };
 }
 
-/* ========================================================================
-   3) Orquestador: recalcular TODOS los grupos
-      - distinct idCliente y delega en recomputeGroupsByIds
-      - Solo PRICING_MODE=prueba para debug
-   ======================================================================== */
+/* ============================================================================
+   3) Recalcular TODOS los grupos
+   ========================================================================== */
 export async function recomputeAllGroups(opts = {}) {
   const ids = await Cliente.distinct("idCliente", { idCliente: { $ne: null } });
   const uniq = [...new Set(ids.map((x) => String(x).trim()).filter(Boolean))];
@@ -290,13 +464,9 @@ export async function recomputeAllGroups(opts = {}) {
   return recomputeGroupsByIds(uniq, { concurrency, barWidth, logEvery, debug });
 }
 
-/* ========================================================================
-   4) Age fix dentro del servicio (opcional):
-      - Normaliza 'fechaNac' (string -> Date) y recalcula 'edad'
-      - Re-precia TODOS o SOLO grupos afectados
-      - PRICING_MODE=prueba => forceAll=true y debug verboso
-      - Reglas SIEMPRE desde Settings (no se pisa base)
-   ======================================================================== */
+/* ============================================================================
+   4) Compat: Age-fix legacy + reprice (solo fechaNac)
+   ========================================================================== */
 export async function fixAgesAndMaybeReprice({
   forceAll = (process.env.PRICING_MODE || "").toLowerCase() === "prueba",
   concurrency = 8,
@@ -446,17 +616,195 @@ export async function fixAgesAndMaybeReprice({
     ids = groups.map((g) => g.idCliente);
   }
 
-  return recomputeGroupsByIds(ids, {
-    concurrency,
-    barWidth,
-    logEvery,
-    debug,
-  });
+  return recomputeGroupsByIds(ids, { concurrency, barWidth, logEvery, debug });
+}
+
+/* ============================================================================
+   (Opcionales útiles, por si querés reportes)
+   ========================================================================== */
+export async function auditAges({ sample = 5 } = {}) {
+  const now = new Date();
+
+  const rows = await Cliente.aggregate([
+    {
+      $project: {
+        idCliente: 1,
+        edad: 1,
+        fechaNac: 1,
+        fechNacimiento: 1,
+        _dobRaw: { $ifNull: ["$fechaNac", "$fechNacimiento"] },
+      },
+    },
+    {
+      $addFields: {
+        _dob: {
+          $switch: {
+            branches: [
+              {
+                case: { $eq: [{ $type: "$_dobRaw" }, "date"] },
+                then: "$_dobRaw",
+              },
+              {
+                case: {
+                  $and: [
+                    { $eq: [{ $type: "$_dobRaw" }, "string"] },
+                    {
+                      $regexMatch: {
+                        input: "$_dobRaw",
+                        regex: "^\\d{1,2}/\\d{1,2}/\\d{2,4}$",
+                      },
+                    },
+                  ],
+                },
+                then: {
+                  $let: {
+                    vars: {
+                      yyyy: {
+                        $cond: [
+                          {
+                            $gte: [
+                              {
+                                $strLenCP: {
+                                  $toString: {
+                                    $arrayElemAt: [
+                                      { $split: ["$_dobRaw", "/"] },
+                                      2,
+                                    ],
+                                  },
+                                },
+                              },
+                              4,
+                            ],
+                          },
+                          {
+                            $dateFromString: {
+                              dateString: "$_dobRaw",
+                              format: "%d/%m/%Y",
+                            },
+                          },
+                          {
+                            $dateFromString: {
+                              dateString: "$_dobRaw",
+                              format: "%d/%m/%y",
+                            },
+                          },
+                        ],
+                      },
+                    },
+                    in: "$$yyyy",
+                  },
+                },
+              },
+            ],
+            default: {
+              $convert: {
+                input: "$_dobRaw",
+                to: "date",
+                onError: null,
+                onNull: null,
+              },
+            },
+          },
+        },
+      },
+    },
+    {
+      $addFields: {
+        _years: {
+          $cond: [
+            { $ne: ["$_dob", null] },
+            { $dateDiff: { startDate: "$_dob", endDate: now, unit: "year" } },
+            null,
+          ],
+        },
+      },
+    },
+    {
+      $addFields: {
+        _yearsValid: {
+          $cond: [
+            {
+              $and: [
+                { $ne: ["$_years", null] },
+                { $gte: ["$_years", 0] },
+                { $lte: ["$_years", 120] },
+              ],
+            },
+            "$_years",
+            null,
+          ],
+        },
+      },
+    },
+    {
+      $addFields: {
+        _mismatch: {
+          $cond: [
+            {
+              $and: [
+                { $ne: ["$_yearsValid", null] },
+                {
+                  $ne: [
+                    { $ifNull: ["$edad", null] },
+                    { $ifNull: ["$_yearsValid", null] },
+                  ],
+                },
+              ],
+            },
+            true,
+            false,
+          ],
+        },
+      },
+    },
+    { $match: { _mismatch: true } },
+    {
+      $facet: {
+        stats: [
+          { $group: { _id: "$_id", idCliente: { $first: "$idCliente" } } },
+          {
+            $group: {
+              _id: null,
+              count: { $sum: 1 },
+              grupos: { $addToSet: "$idCliente" },
+            },
+          },
+        ],
+        sample: [
+          {
+            $project: {
+              _id: 1,
+              idCliente: 1,
+              edadActual: "$edad",
+              edadCalc: "$_yearsValid",
+              dob: "$_dob",
+            },
+          },
+          { $limit: sample },
+        ],
+      },
+    },
+  ]).allowDiskUse(true);
+
+  const stat = rows?.[0]?.stats?.[0] || { count: 0, grupos: [] };
+  const examples = rows?.[0]?.sample || [];
+  return {
+    ok: true,
+    desalineados: stat.count || 0,
+    gruposAfectados: (stat.grupos || []).filter((g) => g != null),
+    ejemplos: examples,
+  };
 }
 
 export default {
+  round500,
+  membersFactor,
+  ageCoef,
+  computeCuotaIdealWith,
+  computeCuotaIdealAsync,
   recomputeGroupPricing,
   recomputeGroupsByIds,
   recomputeAllGroups,
   fixAgesAndMaybeReprice,
+  auditAges,
 };

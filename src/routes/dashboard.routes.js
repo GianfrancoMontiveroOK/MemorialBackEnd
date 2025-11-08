@@ -1,25 +1,16 @@
+// src/routes/dashboard.routes.js
 import { Router } from "express";
-import { getDashboard } from "../controllers/dashboard.controller.js";
-import {
-  requireSession,
-  ensureUserLoaded,
-  superAdminOnly,
-  adminOnly,
-  cobradorOnly,
-} from "../middlewares/roles.js";
+import { requireSession, ensureUserLoaded } from "../middlewares/roles.js";
+import { checkDashboardAccess } from "../controllers/dashboard.controller.js";
 
 const router = Router();
 
-router.get("/dashboard", requireSession, ensureUserLoaded, getDashboard); // 👈
-
-router.get("/dashboard/admin", requireSession, adminOnly, (_req, res) =>
-  res.json({ message: "Zona exclusiva de Admin/SuperAdmin" })
-);
-router.get("/dashboard/super", requireSession, superAdminOnly, (_req, res) =>
-  res.json({ message: "Zona exclusiva de SuperAdmin" })
-);
-router.get("/dashboard/cobrador", requireSession, cobradorOnly, (_req, res) =>
-  res.json({ message: "Zona para Cobradores/Admin/SuperAdmin" })
+// Ruta única
+router.get(
+  "/dashboard",
+  requireSession,
+  ensureUserLoaded,
+  checkDashboardAccess
 );
 
 export default router;

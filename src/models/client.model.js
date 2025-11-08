@@ -1,26 +1,24 @@
+// src/models/client.model.js
 import mongoose from "mongoose";
-import recomputeGroupPricing from "../services/pricing.services.js"; // ⬅ usa tu servicio ESM
+import { recomputeGroupPricing } from "../services/pricing.services.js";
 
-/* ===== Helpers ===== */
 const toBool = (v) => {
   if (typeof v === "boolean") return v;
   if (v === 1 || v === "1" || String(v).toLowerCase() === "true") return true;
   if (v === 0 || v === "0" || String(v).toLowerCase() === "false") return false;
   return Boolean(v);
 };
+
 const toNumOrNull = (v) => {
   if (v === "" || v == null) return null;
   const n = Number(String(v).replace(/[^0-9.-]/g, ""));
   return Number.isFinite(n) ? n : null;
 };
+
 const toDateOrNull = (v) => {
   if (!v) return null;
-  if (
-    typeof v === "string" &&
-    v.trim().replace(/-/g, "").replace(/\s/g, "") === ""
-  )
-    return null;
   const s = String(v).trim();
+  if (!s || s.replace(/-/g, "").replace(/\s/g, "") === "") return null;
   if (/^\d{1,2}\/\d{1,2}\/\d{2,4}$/.test(s)) {
     const [m, d, y] = s.split("/").map((x) => parseInt(x, 10));
     const yyyy = y < 100 ? 1900 + y : y;
@@ -30,14 +28,13 @@ const toDateOrNull = (v) => {
   const dt = new Date(s);
   return Number.isNaN(dt.getTime()) ? null : dt;
 };
+
 const cleanString = (v) => (v == null ? v : String(v).trim());
 
-/* ===== Esquema ===== */
 const ClienteSchema = new mongoose.Schema(
   {
     _id: { type: mongoose.Schema.Types.ObjectId, auto: true },
 
-    // Identificador de agrupación (grupo familiar)
     idCliente: {
       type: Number,
       required: true,
@@ -63,12 +60,12 @@ const ClienteSchema = new mongoose.Schema(
       trim: true,
       set: (v) => (v === 0 ? "" : cleanString(v)),
     },
-
     telefono: {
       type: String,
       trim: true,
       set: (v) => (v === 0 ? "" : cleanString(v)),
     },
+
     documento: { type: String, trim: true, set: cleanString },
     docTipo: {
       type: String,
@@ -90,28 +87,36 @@ const ClienteSchema = new mongoose.Schema(
       set: (v) => toNumOrNull(v) ?? undefined,
     },
 
+    // Rol + posición dentro del grupo (0 = titular, 1..n integrantes)
     rol: {
       type: String,
       enum: ["TITULAR", "INTEGRANTE", "OTRO"],
       default: "TITULAR",
     },
-    integrante: { type: Boolean, default: false, set: toBool },
+    integrante: {
+      type: Number,
+      min: 0,
+      set: (v) => toNumOrNull(v) ?? undefined,
+      index: true,
+    },
     nombreTitular: { type: String, trim: true, set: cleanString },
 
-    // 💾 Histórico que cobrás
+    // Histórico cobrado (último)
     cuota: { type: Number, default: 0, set: (v) => toNumOrNull(v) ?? 0 },
 
-    // 🧮 Dinámica (se recalcula por reglas y se persiste)
+    // Dinámica (recomputada y persistida)
     cuotaIdeal: { type: Number, default: 0, set: (v) => toNumOrNull(v) ?? 0 },
+    usarCuotaIdeal: { type: Boolean, default: true, set: toBool }, // ⬅️ reemplaza usarCuotaPisada
+    // Nota: si quisieras “cuotaManual fija”, la agregamos como campo aparte.
 
-    // ===== NUEVO: flags de producto =====
-    cremacion: { type: Boolean, default: false, set: toBool }, // ⬅ reemplaza al “plan … cremación”
-    parcela: { type: Boolean, default: false, set: toBool }, // ya existía, confirmamos boolean
+    // Flags de producto
+    cremacion: { type: Boolean, default: false, set: toBool },
+    parcela: { type: Boolean, default: false, set: toBool },
 
     observaciones: { type: String, trim: true, set: cleanString },
 
+    // Histórico previo (opcional; se mantiene por si lo usás en migraciones/reportes)
     cuotaAnterior: { type: Number, set: (v) => toNumOrNull(v) ?? undefined },
-    cuotaNueva: { type: Number, set: (v) => toNumOrNull(v) ?? undefined },
 
     emergencia: { type: Boolean, default: false, set: toBool },
 
@@ -133,11 +138,25 @@ const ClienteSchema = new mongoose.Schema(
     ingreso: { type: Date, set: toDateOrNull },
 
     activo: { type: Boolean, default: true, set: toBool },
+
+    // Persistido por el servicio de pricing para facilitar consultas
+    edadMaxPoliza: {
+      type: Number,
+      min: 0,
+      max: 120,
+      set: (v) => toNumOrNull(v) ?? undefined,
+    },
   },
   { timestamps: true, versionKey: false }
 );
 
-/* ===== Hooks de grupo: recalcular cuotaIdeal del grupo tras cambios ===== */
+/* Índices útiles */
+ClienteSchema.index({ idCliente: 1, activo: 1 });
+ClienteSchema.index({ idCliente: 1, integrante: 1 });
+ClienteSchema.index({ idCliente: 1, nombre: 1 });
+ClienteSchema.index({ createdAt: -1 });
+
+/* Helpers internos */
 async function _getIdClienteFromOp(docOrQuery) {
   try {
     if (docOrQuery?.idCliente != null) return Number(docOrQuery.idCliente);
@@ -153,6 +172,7 @@ async function _getIdClienteFromOp(docOrQuery) {
   }
 }
 
+/* Hooks: recomputar pricing del grupo tras cambios */
 ClienteSchema.post("save", async function (doc, next) {
   try {
     const idCliente = Number(doc?.idCliente);
