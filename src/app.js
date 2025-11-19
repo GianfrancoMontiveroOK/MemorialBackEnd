@@ -37,6 +37,7 @@ app.set("trust proxy", 1);
 
 // 🔗 Orígenes permitidos
 const ALLOWED_ORIGINS = [
+  "https://www.memorialsanrafael.com.ar",
   process.env.FRONT_ORIGIN, // opcional por .env
 ].filter(Boolean);
 
