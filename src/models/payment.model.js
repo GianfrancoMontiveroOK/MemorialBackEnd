@@ -1,7 +1,21 @@
 import mongoose from "mongoose";
 
-const METHODS = ["efectivo", "transferencia", "tarjeta", "qr", "otro"];
-const CHANNELS = ["field", "backoffice", "portal", "api"];
+const METHODS = [
+  "efectivo",
+  "transferencia",
+  "tarjeta",
+  "qr",
+  "otro",
+  "debito_automatico",
+];
+const CHANNELS = [
+  "field",
+  "backoffice",
+  "portal",
+  "api",
+  "debito_automatico_naranja",
+  "debito_automatico_bna",
+];
 const STATUSES = ["draft", "posted", "settled", "reversed"]; // 'deleted' NO existe (WORM)
 const KINDS = ["payment", "adjustment", "reversal"]; // tipificar evento económico
 

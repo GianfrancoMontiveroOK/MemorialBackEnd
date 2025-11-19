@@ -544,9 +544,12 @@ export async function listArqueosUsuarios(req, res, next) {
         return { boxes, totalBalance, lastMovementAt, paymentsCount };
       };
 
-      const [chica, grande] = await Promise.all([
+      // ⬅️ AHORA traemos también BANCO_NACION y TARJETA_NARANJA
+      const [chica, grande, bancoNacion, tarjetaNaranja] = await Promise.all([
         makeGlobalBoxes("CAJA_CHICA"),
         makeGlobalBoxes("CAJA_GRANDE"),
+        makeGlobalBoxes("BANCO_NACION"),
+        makeGlobalBoxes("TARJETA_NARANJA"),
       ]);
 
       const globalRows = [
@@ -574,6 +577,30 @@ export async function listArqueosUsuarios(req, res, next) {
           isGlobal: true,
           globalCode: "CAJA_CHICA",
         },
+        {
+          _id: "GLOBAL:BANCO_NACION",
+          name: "BANCO_NACION (GLOBAL)",
+          email: "",
+          role: "global",
+          boxes: bancoNacion.boxes,
+          totalBalance: bancoNacion.totalBalance,
+          lastMovementAt: bancoNacion.lastMovementAt,
+          paymentsCount: bancoNacion.paymentsCount,
+          isGlobal: true,
+          globalCode: "BANCO_NACION",
+        },
+        {
+          _id: "GLOBAL:TARJETA_NARANJA",
+          name: "TARJETA_NARANJA (GLOBAL)",
+          email: "",
+          role: "global",
+          boxes: tarjetaNaranja.boxes,
+          totalBalance: tarjetaNaranja.totalBalance,
+          lastMovementAt: tarjetaNaranja.lastMovementAt,
+          paymentsCount: tarjetaNaranja.paymentsCount,
+          isGlobal: true,
+          globalCode: "TARJETA_NARANJA",
+        },
       ];
 
       const matchesQ = (row) =>
@@ -595,12 +622,15 @@ export async function listArqueosUsuarios(req, res, next) {
     function orderRank(row) {
       const id = String(row?._id || "");
       const role = String(row?.role || "");
+
       if (id === "GLOBAL:CAJA_GRANDE") return 0;
       if (id === "GLOBAL:CAJA_CHICA") return 1;
-      if (role === "superAdmin") return 2;
-      if (role === "admin") return 3;
-      if (role === "cobrador") return 4;
-      return 5;
+      if (id === "GLOBAL:BANCO_NACION") return 2;
+      if (id === "GLOBAL:TARJETA_NARANJA") return 3;
+      if (role === "superAdmin") return 4;
+      if (role === "admin") return 5;
+      if (role === "cobrador") return 6;
+      return 7;
     }
 
     const finalSorted =
@@ -620,7 +650,7 @@ export async function listArqueosUsuarios(req, res, next) {
         : merged;
 
     // ---------- Paginado final
-    const total = (countRes?.[0]?.n || 0) + globalsAdded;
+    const total = totalReal + globalsAdded;
     const start = (page - 1) * limit;
     const end = start + limit;
     const paged = finalSorted.slice(start, end);
@@ -652,7 +682,9 @@ export async function listArqueosUsuarios(req, res, next) {
         q,
         destAccountCode,
         injectedGlobals:
-          viewerRole === "superAdmin" ? ["CAJA_CHICA", "CAJA_GRANDE"] : [],
+          viewerRole === "superAdmin"
+            ? ["CAJA_CHICA", "CAJA_GRANDE", "BANCO_NACION", "TARJETA_NARANJA"]
+            : [],
         orderMode,
       },
     });
