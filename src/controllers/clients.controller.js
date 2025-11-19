@@ -267,6 +267,12 @@ export async function getClienteById(req, res, next) {
     return !Number.isNaN(d.getTime());
   };
 
+  // Activo robusto: baja es fecha válida ⇒ inactivo; activo === false ⇒ inactivo
+  const isActiveRobust = (m) => {
+    if (isValidDate(m?.baja)) return false;
+    return m?.activo !== false;
+  };
+
   // Campos sensibles que removemos para el rol "cobrador"
   const SENSITIVE_KEYS = new Set([
     "domicilio",
@@ -325,12 +331,6 @@ export async function getClienteById(req, res, next) {
     return redact ? list.map((m) => allowForCollector(m)) : list;
   };
 
-  // Activo robusto: baja es fecha válida ⇒ inactivo; activo === false ⇒ inactivo
-  const isActiveRobust = (m) => {
-    if (isValidDate(m?.baja)) return false;
-    return m?.activo !== false;
-  };
-
   try {
     const id = String(req.params.id || "").trim();
     if (!isObjectId(id))
@@ -359,29 +359,24 @@ export async function getClienteById(req, res, next) {
         // Leemos TODO el grupo de ese idCliente
         const list = await Cliente.find({ idCliente: n })
           .select(
-            "_id idCliente nombre documento edad fechaNac activo cuota docTipo cuotaIdeal cremacion parcela rol integrante nombreTitular baja usarCuotaIdeal ingreso vigencia createdAt updatedAt sexo"
+            "_id idCliente nombre documento edad fechaNac activo cuota docTipo cuotaIdeal cremacion parcela rol integrante nombreTitular baja usarCuotaIdeal ingreso vigencia createdAt updatedAt sexo ciudad provincia cp telefono"
           )
           .sort({ rol: 1, integrante: 1, nombre: 1, _id: 1 })
           .lean();
 
         // family SIN el titular (para tablas/listas)
-        const family = list.filter((m) => String(m._id) !== String(docRaw._id));
+        const familyRaw = list.filter(
+          (m) => String(m._id) !== String(docRaw._id)
+        );
 
         // Activos robustos y SOLO póliza (TITULAR/INTEGRANTE)
-        const ALLOWED = new Set(["TITULAR", "INTEGRANTE"]);
-        const isValidDate = (v) => {
-          if (!v) return false;
-          const d = v instanceof Date ? v : new Date(v);
-          return !Number.isNaN(d.getTime());
-        };
-        const isActiveRobust = (m) =>
-          m?.activo !== false && !isValidDate(m?.baja);
+        const ALLOWED_ROL = new Set(["TITULAR", "INTEGRANTE"]);
 
         // ⚠️ MUY IMPORTANTE: incluir al titular en el cómputo
-        const todos = [docRaw, ...family];
+        const todos = [docRaw, ...familyRaw];
         const activosPoliza = todos
           .filter(isActiveRobust)
-          .filter((m) => ALLOWED.has(m?.rol));
+          .filter((m) => ALLOWED_ROL.has(m?.rol));
 
         const cremacionesCount = activosPoliza.reduce(
           (acc, m) => acc + (m?.cremacion ? 1 : 0),
@@ -394,7 +389,10 @@ export async function getClienteById(req, res, next) {
               ? Number(m.edad)
               : m?.fechaNac
               ? (() => {
-                  const d = new Date(m.fechaNac);
+                  const d =
+                    m.fechaNac instanceof Date
+                      ? m.fechaNac
+                      : new Date(m.fechaNac);
                   if (Number.isNaN(d.getTime())) return undefined;
                   const t = new Date();
                   let a = t.getFullYear() - d.getFullYear();
@@ -410,7 +408,8 @@ export async function getClienteById(req, res, next) {
           ? Math.max(...edades)
           : Number(docRaw.edad) || 0;
 
-        payload.family = family; // sin titular
+        // 🔒 Aplicar redacción a family si corresponde
+        payload.family = redactFamilyIfNeeded(familyRaw, redact);
         payload.__groupInfo = {
           integrantesCount: activosPoliza.length, // titular + integrantes activos
           cremacionesCount,
@@ -833,6 +832,14 @@ export async function updateCliente(req, res, next) {
     delete payloadRaw._id;
     const payload = normalizePayload(payloadRaw);
 
+    // Guardamos y sacamos integrantes del payload del titular
+    const incomingIntegrantes = Array.isArray(payload.integrantes)
+      ? payload.integrantes
+      : null;
+    if (incomingIntegrantes) {
+      delete payload.integrantes;
+    }
+
     if (payload.hasOwnProperty("idCliente")) {
       const n = Number(payload.idCliente);
       if (!Number.isFinite(n))
@@ -869,14 +876,22 @@ export async function updateCliente(req, res, next) {
       "parcela",
     ].some((k) => touchedKeys.has(k));
 
-    // Update base
+    const integrantesPayloadPresent = Array.isArray(incomingIntegrantes);
+
+    // ===== Update base (titular) =====
     const updated = await Cliente.findByIdAndUpdate(
       id,
       { $set: payload },
       { new: true, runValidators: true }
     ).lean();
 
-    // ===== Orquestación de grupo =====
+    if (!updated) {
+      return res
+        .status(404)
+        .json({ message: "Cliente no encontrado (post-update)" });
+    }
+
+    // ===== Orquestación de grupo (titular / nombre / promoción) =====
     let mustPromote = false;
     const nowInactive =
       updated?.activo === false ||
@@ -885,6 +900,7 @@ export async function updateCliente(req, res, next) {
     if (wasTitular && nowInactive) mustPromote = true;
 
     if (payload.rol === "TITULAR" && !wasTitular) {
+      // Si este pasa a ser titular, los otros titulares del grupo pasan a INTEGRANTE
       await Cliente.updateMany(
         { idCliente: gid, rol: "TITULAR", _id: { $ne: updated._id } },
         { $set: { rol: "INTEGRANTE" } }
@@ -909,12 +925,115 @@ export async function updateCliente(req, res, next) {
       }
     }
 
+    // ===== Upsert de integrantes (familiares del grupo) =====
+    let integrantesTouched = false;
+
+    if (Array.isArray(incomingIntegrantes)) {
+      integrantesTouched = true;
+
+      // Todos los miembros actuales del grupo, excepto el titular que acabamos de editar
+      const existingMembers = await Cliente.find({
+        idCliente: gid,
+        _id: { $ne: updated._id },
+      }).lean();
+
+      const existingById = new Map(
+        existingMembers.map((m) => [String(m._id), m])
+      );
+      const incomingIds = new Set();
+
+      const today = new Date().toISOString().slice(0, 10);
+
+      // Helpers pequeños de normalización
+      const normNombre = (s) => (s || "").toString().trim().toUpperCase();
+      const normDoc = (s) => (s || "").toString().trim();
+      const toBool = (v) =>
+        typeof v === "boolean"
+          ? v
+          : String(v).toLowerCase() === "true" || Number(v) === 1;
+      const toNumOr = (v, fb) =>
+        v === "" || v == null || Number.isNaN(Number(v)) ? fb : Number(v);
+
+      // Upsert de cada integrante entrante
+      for (const raw of incomingIntegrantes) {
+        if (!raw) continue;
+
+        const _idStr = raw._id ? String(raw._id) : null;
+        if (_idStr) incomingIds.add(_idStr);
+
+        const base = {
+          nombre: normNombre(raw.nombre),
+          documento: normDoc(raw.documento),
+          docTipo: raw.docTipo || "DNI",
+          fechaNac: raw.fechaNac || null,
+          edad: toNumOr(raw.edad, undefined),
+          sexo: raw.sexo || "X",
+          cuil: (raw.cuil || "").toString().trim(),
+          telefono: (raw.telefono || "").toString().trim(),
+          domicilio: (raw.domicilio || "").toString().trim(),
+          ciudad: (raw.ciudad || "").toString().trim(),
+          provincia: (raw.provincia || "").toString().trim(),
+          cp: (raw.cp || "").toString().trim(),
+          observaciones: (raw.observaciones || "").toString().trim(),
+          cremacion: toBool(raw.cremacion),
+          parcela: toBool(raw.parcela),
+          activo: raw.activo === false ? false : true,
+          idCliente: gid,
+          rol: "INTEGRANTE",
+        };
+
+        if (_idStr && existingById.has(_idStr)) {
+          // Update integrante existente
+          await Cliente.findByIdAndUpdate(
+            _idStr,
+            { $set: base },
+            { runValidators: true }
+          );
+        } else {
+          // Crear nuevo integrante
+          await Cliente.create({
+            ...base,
+            integrante: 0, // luego resequenceIntegrantes lo corrige
+          });
+        }
+      }
+
+      // Dar de baja integrantes que ya existían pero no vienen más en el payload
+      const toDeactivate = existingMembers
+        .filter((m) => !incomingIds.has(String(m._id)))
+        .map((m) => m._id);
+
+      if (toDeactivate.length > 0) {
+        await Cliente.updateMany(
+          { _id: { $in: toDeactivate } },
+          {
+            $set: {
+              activo: false,
+              baja: today,
+            },
+          }
+        );
+      }
+
+      // Reordenar índices de integrante y asegurar nombre de titular replicado
+      await resequenceIntegrantes(gid);
+      const titularDoc = await Cliente.findOne({
+        idCliente: gid,
+        rol: "TITULAR",
+      }).lean();
+      if (titularDoc) {
+        await propagateTitularName(gid, (titularDoc?.nombre || "").trim());
+      }
+    }
+
     // ===== Repricing (solo ideal) =====
-    if (
+    const needsRepricing =
       priceAffectingChange ||
       mustPromote ||
-      touchedKeys.has("usarCuotaIdeal")
-    ) {
+      touchedKeys.has("usarCuotaIdeal") ||
+      integrantesTouched;
+
+    if (needsRepricing) {
       await recomputeGroupPricing(gid, { debug: false });
     }
 
@@ -934,16 +1053,15 @@ export async function updateCliente(req, res, next) {
         await setMemberHistoricalToIdeal(updated._id);
       }
     } else {
-      // === NUEVO: caso "OFF" + cambio de cuota => propagar histórica manual a todo el grupo activo ===
-      const wasUsingIdeal = !!current.usarCuotaIdeal; // ← NUEVO
+      // === caso "OFF" + cambio de cuota => propagar histórica manual a todo el grupo activo ===
+      const wasUsingIdeal = !!current.usarCuotaIdeal;
       const turnedOffIdeal =
-        flagPresent && wasUsingIdeal && payload.usarCuotaIdeal === false; // ← NUEVO
+        flagPresent && wasUsingIdeal && payload.usarCuotaIdeal === false;
 
       if (turnedOffIdeal && manualCuotaChange && Number.isFinite(newCuota)) {
-        // ← NUEVO
-        await setGroupHistoricalCuota(gid, newCuota, { onlyActive: true }); // ← NUEVO
+        await setGroupHistoricalCuota(gid, newCuota, { onlyActive: true });
       } else if (manualCuotaChange && Number.isFinite(newCuota)) {
-        // (se deja como opcional el comportamiento anterior)
+        // comportamiento opcional anterior (lo dejo comentado)
         // await setGroupHistoricalCuota(gid, newCuota, { onlyActive: true });
       }
     }

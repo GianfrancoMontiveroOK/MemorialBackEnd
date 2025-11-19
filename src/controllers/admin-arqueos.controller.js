@@ -2,16 +2,22 @@ import mongoose from "mongoose";
 import User from "../models/user.model.js";
 import LedgerEntry from "../models/ledger-entry.model.js";
 import Payment from "../models/payment.model.js";
-import Client from "../models/client.model.js";
-
-import { onlyDigits, yyyymmAR } from "./collector.shared.js";
-
+import Cliente from "../models/client.model.js";
 // ───────────────────── Helpers ─────────────────────
-const toInt = (v, def = 0) => {
+const toInt = (v, d = 0) => {
   const n = Number.parseInt(v, 10);
-  return Number.isFinite(n) ? n : def;
+  return Number.isFinite(n) ? n : d;
 };
+// ⬇️ Colocá esto arriba del archivo (o importá tu util real)
+function yyyymmAR(date) {
+  const d = date instanceof Date ? date : new Date(date);
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, "0");
+  return `${y}-${m}`; // formato "YYYY-MM" como espera allocations.period
+}
+
 const toDir = (v) => (String(v || "").toLowerCase() === "asc" ? 1 : -1);
+
 const parseISODate = (s, endOfDay = false) => {
   if (!s) return null;
   const dt = new Date(`${s}T00:00:00`);
@@ -20,11 +26,6 @@ const parseISODate = (s, endOfDay = false) => {
   return dt;
 };
 
-// Cuentas
-const DEST_DEFAULT = "CAJA_ADMIN";
-const DEFAULT_ACCOUNTS = ["CAJA_COBRADOR", "A_RENDIR_COBRADOR"];
-
-// Expr sumas condicionales
 const debitExpr = {
   $sum: { $cond: [{ $eq: ["$side", "debit"] }, "$amount", 0] },
 };
@@ -32,28 +33,42 @@ const creditExpr = {
   $sum: { $cond: [{ $eq: ["$side", "credit"] }, "$amount", 0] },
 };
 
+// Cuentas
+const DEST_DEFAULT = "CAJA_ADMIN";
+const DEFAULT_ACCOUNTS = ["CAJA_COBRADOR", "A_RENDIR_COBRADOR"];
+const CAJA_CHICA = "CAJA_CHICA"; // global
+const CAJA_GRANDE = "CAJA_GRANDE"; // global
+const CAJA_SUPERADMIN = "CAJA_SUPERADMIN"; // personal SA
+
+// Conjunto por defecto para superAdmin (incluye globales + su billetera personal)
+const SUPERADMIN_ACCOUNTS = [CAJA_GRANDE, CAJA_SUPERADMIN, CAJA_CHICA];
+
 // Roles con caja
 const BOX_ROLES = ["cobrador", "admin", "superAdmin"];
 
 // Detecta si un string parece ObjectId
 const asObjectId = (s) => {
   try {
-    return new mongoose.Types.ObjectId(String(s));
+    const str = String(s);
+    if (!/^[0-9a-fA-F]{24}$/.test(str)) return null;
+    return new mongoose.Types.ObjectId(str);
   } catch {
     return null;
   }
 };
 
-// 🔧 Match UNIFICADO por usuario y cuentas
+// 🔧 Match unificado por usuario y cuentas
+// - admin / superAdmin: match estricto por userId
+// - cobrador: match por userId|fromUserId|toUserId ó por dimensions.idCobrador/cobradorId
 function buildUserLedgerMatch({ user, accounts, fromDt, toDt, side }) {
   const uid = new mongoose.Types.ObjectId(String(user._id));
+
   const byUserId = [
     { userId: uid },
     { "dimensions.fromUserId": uid },
     { "dimensions.toUserId": uid },
   ];
 
-  // Para cobrador, además aceptar idCobrador (string/number)
   const byCollectorId =
     user.role === "cobrador" && user.idCobrador != null
       ? [
@@ -76,10 +91,16 @@ function buildUserLedgerMatch({ user, accounts, fromDt, toDt, side }) {
         ]
       : [];
 
-  const match = {
-    accountCode: { $in: accounts },
-    $or: [...byUserId, ...byCollectorId],
-  };
+  // Base por cuentas
+  const match = { accountCode: { $in: accounts } };
+
+  if (user.role === "admin" || user.role === "superAdmin") {
+    // Vinculación estricta por userId (las globales se consultan por endpoints específicos)
+    match.userId = uid;
+  } else {
+    // Cobrador: laxo
+    match.$or = [...byUserId, ...byCollectorId];
+  }
 
   if (side === "debit" || side === "credit") match.side = side;
 
@@ -92,6 +113,138 @@ function buildUserLedgerMatch({ user, accounts, fromDt, toDt, side }) {
   return match;
 }
 
+async function createLedgerTransfer({
+  from, // { userId, accountCode }
+  to, // { userId, accountCode }
+  amount,
+  currency = "ARS",
+  kind, // ej. "CAJA_CHICA_DEPOSITO"
+  note = "",
+  extraDims = {}, // { idCobrador, dateFrom, dateTo, performedBy, ... }
+  idemScope = "", // string para idempotencia contextual
+}) {
+  if (!from?.userId || !to?.userId) {
+    throw new Error("createLedgerTransfer: faltan userId origen/destino");
+  }
+  if (!from?.accountCode || !to?.accountCode) {
+    throw new Error("createLedgerTransfer: faltan cuentas origen/destino");
+  }
+  const amt = Number(amount);
+  if (!Number.isFinite(amt) || amt <= 0) {
+    throw new Error("createLedgerTransfer: monto inválido");
+  }
+
+  const now = new Date();
+  const paymentId = new mongoose.Types.ObjectId();
+  const idemKey = [
+    "xfer",
+    kind || "GENERIC",
+    String(from.userId),
+    from.accountCode,
+    String(to.userId),
+    to.accountCode,
+    currency,
+    Math.floor(now.getTime() / 60000), // granularidad minuto
+    idemScope || "",
+  ].join(":");
+
+  // Evitar duplicados (chequea línea destino DEBIT con el idemKey)
+  const exists = await LedgerEntry.findOne({
+    "dimensions.idemKey": idemKey,
+    userId: to.userId,
+    accountCode: to.accountCode,
+    side: "debit",
+    currency,
+  }).lean();
+  if (exists) return { ok: true, skipped: true, paymentId, idemKey };
+
+  const dims = {
+    kind: kind || "GENERIC",
+    note,
+    idemKey,
+    fromUserId: from.userId,
+    toUserId: to.userId,
+    ...extraDims,
+  };
+
+  const creditOut = {
+    paymentId,
+    userId: from.userId,
+    accountCode: from.accountCode,
+    side: "credit",
+    amount: amt,
+    currency,
+    postedAt: now,
+    dimensions: dims,
+  };
+
+  const debitIn = {
+    paymentId,
+    userId: to.userId,
+    accountCode: to.accountCode,
+    side: "debit",
+    amount: amt,
+    currency,
+    postedAt: now,
+    dimensions: dims,
+  };
+
+  const entries = await LedgerEntry.insertMany([creditOut, debitIn], {
+    ordered: true,
+  });
+
+  return { ok: true, paymentId, idemKey, entryIds: entries.map((e) => e._id) };
+}
+
+async function getBalance({
+  userId,
+  accountCode,
+  currency = "ARS",
+  fromDt,
+  toDt,
+}) {
+  const match = {
+    userId: new mongoose.Types.ObjectId(String(userId)),
+    accountCode,
+    currency,
+    ...(fromDt || toDt
+      ? {
+          postedAt: {
+            ...(fromDt ? { $gte: fromDt } : {}),
+            ...(toDt ? { $lte: toDt } : {}),
+          },
+        }
+      : {}),
+  };
+
+  const r = await LedgerEntry.aggregate([
+    { $match: match },
+    { $group: { _id: null, debits: debitExpr, credits: creditExpr } },
+    { $project: { _id: 0, balance: { $subtract: ["$debits", "$credits"] } } },
+  ]);
+
+  return Number(r?.[0]?.balance || 0);
+}
+
+// Opcional: exportar lo que uses desde otros módulos
+export {
+  toInt,
+  parseISODate,
+  debitExpr,
+  creditExpr,
+  DEST_DEFAULT,
+  DEFAULT_ACCOUNTS,
+  CAJA_CHICA,
+  CAJA_GRANDE,
+  CAJA_SUPERADMIN,
+  SUPERADMIN_ACCOUNTS,
+  BOX_ROLES,
+  asObjectId,
+  buildUserLedgerMatch,
+  createLedgerTransfer,
+  getBalance,
+};
+
 /* ======================= 1) Listado de usuarios (cajas) ======================= */
 /**
  * GET /api/admin/arqueos/usuarios
@@ -102,13 +255,18 @@ export async function listArqueosUsuarios(req, res, next) {
     const page = Math.max(toInt(req.query.page, 1), 1);
     const limit = Math.max(Math.min(toInt(req.query.limit || 25, 25), 200), 1);
     const q = String(req.query.q || "").trim();
-    const roleFilter = String(req.query.role || "").trim();
+    const roleFilter = String(req.query.role || "").trim(); // "admin" | "superAdmin" | "cobrador" | "global" | ""
     const sortByParam = String(req.query.sortBy || "totalBalance");
-    const sortDirParam = toDir(req.query.sortDir || "desc");
+    const sortDirParam = toDir(req.query.sortDir || "desc"); // 1 = asc, -1 = desc
+    const orderMode = String(req.query.orderMode || "default"); // "default" | "hierarchy"
 
     const viewerRole = String(req.user?.role || "").trim();
+
+    // Quiénes pueden listar "usuarios" reales (las cajas globales se inyectan aparte)
     const ALLOWED_BY_VIEWER =
-      viewerRole === "superAdmin" ? ["admin", "cobrador"] : ["cobrador"];
+      viewerRole === "superAdmin"
+        ? ["superAdmin", "admin", "cobrador"]
+        : ["cobrador"];
 
     const destAccountCode =
       String(req.query.destAccountCode || DEST_DEFAULT).trim() || DEST_DEFAULT;
@@ -124,7 +282,7 @@ export async function listArqueosUsuarios(req, res, next) {
     const fromDt = parseISODate(req.query.dateFrom);
     const toDt = parseISODate(req.query.dateTo, true);
 
-    // ---- Filtro de usuarios
+    // ---------- Filtro de usuarios reales
     const userMatch = { role: { $in: ALLOWED_BY_VIEWER } };
     if (roleFilter && ALLOWED_BY_VIEWER.includes(roleFilter)) {
       userMatch.role = roleFilter;
@@ -138,7 +296,7 @@ export async function listArqueosUsuarios(req, res, next) {
       ];
     }
 
-    // ---- Aggregation
+    // ---------- Pipeline base (no paginamos aún; inyectamos globales y luego paginamos)
     const base = [
       { $match: userMatch },
       {
@@ -150,7 +308,7 @@ export async function listArqueosUsuarios(req, res, next) {
               $match: {
                 $expr: {
                   $and: [
-                    // 1) Cuentas según rol (admin => solo destino)
+                    // 1) Cuentas por rol (si no hay override)
                     {
                       $in: [
                         "$accountCode",
@@ -158,20 +316,29 @@ export async function listArqueosUsuarios(req, res, next) {
                           ? accountCodesOverride
                           : {
                               $cond: [
+                                // admin => sólo cuenta destino (p.ej. CAJA_ADMIN o DEST_DEFAULT)
                                 { $eq: ["$$urole", "admin"] },
                                 [destAccountCode],
-                                DEFAULT_ACCOUNTS,
+                                {
+                                  $cond: [
+                                    // superAdmin => SOLO personal: CAJA_SUPERADMIN (NUNCA GRANDE acá)
+                                    { $eq: ["$$urole", "superAdmin"] },
+                                    ["CAJA_SUPERADMIN"],
+                                    // cobrador => cuentas por defecto
+                                    DEFAULT_ACCOUNTS,
+                                  ],
+                                },
                               ],
                             },
                       ],
                     },
 
-                    // 2) VINCULACIÓN POR USUARIO (arreglado):
-                    //    - Si es admin: SOLO userId == uid (no dimensions, no idCobrador)
-                    //    - Si es cobrador: userId|fromUserId|toUserId == uid  OR  dimensions.idCobrador/cobradorId == idCob
+                    // 2) Vinculación por usuario:
+                    //    - admin/superAdmin: SOLO userId == uid
+                    //    - cobrador: userId|fromUserId|toUserId == uid  OR  dimensions.idCobrador/cobradorId == idCob
                     {
                       $cond: [
-                        { $eq: ["$$urole", "admin"] },
+                        { $in: ["$$urole", ["admin", "superAdmin"]] },
                         {
                           $eq: [
                             { $toString: "$userId" },
@@ -307,24 +474,160 @@ export async function listArqueosUsuarios(req, res, next) {
     const sortBy = SORTABLE.has(sortByParam) ? sortByParam : "totalBalance";
     const sortStage = { $sort: { [sortBy]: sortDirParam, _id: sortDirParam } };
 
-    const dataPipeline = [
-      ...base,
-      sortStage,
-      { $skip: (page - 1) * limit },
-      { $limit: limit },
-    ];
+    const dataPipeline = [...base, sortStage];
     const countPipeline = [{ $match: userMatch }, { $count: "n" }];
 
-    const [items, countRes] = await Promise.all([
+    const [realItems, countRes] = await Promise.all([
       User.aggregate(dataPipeline).allowDiskUse(true),
       User.aggregate(countPipeline).allowDiskUse(true),
     ]);
 
-    const total = countRes?.[0]?.n || 0;
+    const totalReal = countRes?.[0]?.n || 0;
+
+    // ---------- Inyección de "usuarios virtuales" (cajas globales) cuando el viewer es SA
+    let merged = realItems;
+    let globalsAdded = 0;
+
+    const includeGlobals =
+      viewerRole === "superAdmin" &&
+      (!roleFilter || roleFilter === "" || roleFilter === "global");
+
+    if (includeGlobals) {
+      const matchDate =
+        fromDt || toDt
+          ? {
+              postedAt: {
+                ...(fromDt ? { $gte: fromDt } : {}),
+                ...(toDt ? { $lte: toDt } : {}),
+              },
+            }
+          : {};
+
+      const makeGlobalBoxes = async (accCode) => {
+        const boxes = await LedgerEntry.aggregate([
+          { $match: { accountCode: accCode, ...matchDate } },
+          {
+            $group: {
+              _id: { currency: "$currency" },
+              debits: debitExpr,
+              credits: creditExpr,
+              lastMovementAt: { $max: "$postedAt" },
+              paymentsSet: { $addToSet: "$paymentId" },
+            },
+          },
+          {
+            $project: {
+              _id: 0,
+              currency: "$_id.currency",
+              debits: 1,
+              credits: 1,
+              balance: { $subtract: ["$debits", "$credits"] },
+              lastMovementAt: 1,
+              paymentsCount: { $size: "$paymentsSet" },
+            },
+          },
+        ]);
+
+        const totalBalance = (boxes || []).reduce(
+          (s, b) => s + Number(b?.balance || 0),
+          0
+        );
+        const lastMovementAt = (boxes || []).reduce((max, b) => {
+          const d = b?.lastMovementAt ? new Date(b.lastMovementAt) : null;
+          return d && !isNaN(d) && (!max || d > max) ? d : max;
+        }, null);
+        const paymentsCount = (boxes || []).reduce(
+          (s, b) => s + Number(b?.paymentsCount || 0),
+          0
+        );
+
+        return { boxes, totalBalance, lastMovementAt, paymentsCount };
+      };
+
+      const [chica, grande] = await Promise.all([
+        makeGlobalBoxes("CAJA_CHICA"),
+        makeGlobalBoxes("CAJA_GRANDE"),
+      ]);
+
+      const globalRows = [
+        {
+          _id: "GLOBAL:CAJA_GRANDE",
+          name: "CAJA_GRANDE (GLOBAL)",
+          email: "",
+          role: "global",
+          boxes: grande.boxes,
+          totalBalance: grande.totalBalance,
+          lastMovementAt: grande.lastMovementAt,
+          paymentsCount: grande.paymentsCount,
+          isGlobal: true,
+          globalCode: "CAJA_GRANDE",
+        },
+        {
+          _id: "GLOBAL:CAJA_CHICA",
+          name: "CAJA_CHICA (GLOBAL)",
+          email: "",
+          role: "global",
+          boxes: chica.boxes,
+          totalBalance: chica.totalBalance,
+          lastMovementAt: chica.lastMovementAt,
+          paymentsCount: chica.paymentsCount,
+          isGlobal: true,
+          globalCode: "CAJA_CHICA",
+        },
+      ];
+
+      const matchesQ = (row) =>
+        !q ||
+        String(row.name || "")
+          .toLowerCase()
+          .includes(q.toLowerCase()) ||
+        String(row._id || "")
+          .toLowerCase()
+          .includes(q.toLowerCase());
+
+      const filteredGlobals = globalRows.filter(matchesQ);
+      globalsAdded = filteredGlobals.length;
+
+      merged = [...realItems, ...filteredGlobals];
+    }
+
+    // ---------- Orden final (jerárquico si se solicita)
+    function orderRank(row) {
+      const id = String(row?._id || "");
+      const role = String(row?.role || "");
+      if (id === "GLOBAL:CAJA_GRANDE") return 0;
+      if (id === "GLOBAL:CAJA_CHICA") return 1;
+      if (role === "superAdmin") return 2;
+      if (role === "admin") return 3;
+      if (role === "cobrador") return 4;
+      return 5;
+    }
+
+    const finalSorted =
+      orderMode === "hierarchy"
+        ? [...merged].sort((a, b) => {
+            const ra = orderRank(a);
+            const rb = orderRank(b);
+            if (ra !== rb) return ra - rb;
+
+            // Dentro del bloque, usamos el sort original pedido por query
+            const av = a[sortBy] ?? (sortBy === "name" ? "" : 0);
+            const bv = b[sortBy] ?? (sortBy === "name" ? "" : 0);
+            if (av < bv) return sortDirParam;
+            if (av > bv) return -sortDirParam;
+            return String(a._id).localeCompare(String(b._id)) * sortDirParam;
+          })
+        : merged;
+
+    // ---------- Paginado final
+    const total = (countRes?.[0]?.n || 0) + globalsAdded;
+    const start = (page - 1) * limit;
+    const end = start + limit;
+    const paged = finalSorted.slice(start, end);
 
     return res.json({
       ok: true,
-      items,
+      items: paged,
       total,
       page,
       pageSize: limit,
@@ -336,8 +639,11 @@ export async function listArqueosUsuarios(req, res, next) {
         role:
           roleFilter && ALLOWED_BY_VIEWER.includes(roleFilter)
             ? roleFilter
+            : roleFilter === "global"
+            ? "global"
             : null,
         accountCodes: accountCodesOverride || {
+          superAdmin: ["CAJA_SUPERADMIN"], // <- SA no suma GRANDE aquí
           admin: [destAccountCode],
           cobrador: DEFAULT_ACCOUNTS,
         },
@@ -345,6 +651,9 @@ export async function listArqueosUsuarios(req, res, next) {
         dateTo: req.query.dateTo || null,
         q,
         destAccountCode,
+        injectedGlobals:
+          viewerRole === "superAdmin" ? ["CAJA_CHICA", "CAJA_GRANDE"] : [],
+        orderMode,
       },
     });
   } catch (err) {
@@ -402,8 +711,10 @@ export async function getArqueoUsuarioDetalle(req, res, next) {
       accountCodesOverride.length > 0
         ? accountCodesOverride
         : user.role === "admin"
-        ? [destAccountCode]
-        : DEFAULT_ACCOUNTS;
+        ? [destAccountCode] // CAJA_ADMIN (u otra dest)
+        : user.role === "superAdmin"
+        ? SUPERADMIN_ACCOUNTS // ⬅️ CAJA_GRANDE + CAJA_SUPERADMIN
+        : DEFAULT_ACCOUNTS; // cobrador
 
     const match = buildUserLedgerMatch({
       user,
@@ -580,7 +891,7 @@ export async function crearArqueoUsuario(req, res, next) {
     const fromDt = parseISODate(df);
     const toDt = parseISODate(dt, true);
 
-    // 4) Saldo por moneda del cobrador usando el MATCH UNIFICADO (coherente con listado/detalle)
+    // 4) Saldo por moneda del cobrador (match coherente con listados)
     const matchCollector = buildUserLedgerMatch({
       user: cobradorUser,
       accounts: accts,
@@ -625,7 +936,7 @@ export async function crearArqueoUsuario(req, res, next) {
       });
     }
 
-    // 5) Asientos (idempotentes) — ¡userId correcto por línea!
+    // 5) Asientos idempotentes — userId correcto por línea
     const now = new Date();
     const created = [];
 
@@ -636,6 +947,7 @@ export async function crearArqueoUsuario(req, res, next) {
         adminUserId
       )}:${destAcct}:${currency}:${Math.floor(now.getTime() / 60000)}`;
 
+      // idempotencia: chequeo en la línea destino (debit)
       const exists = await LedgerEntry.findOne({
         "dimensions.idemKey": idemKey,
         accountCode: destAcct,
@@ -647,7 +959,7 @@ export async function crearArqueoUsuario(req, res, next) {
 
       const syntheticPaymentId = new mongoose.Types.ObjectId();
 
-      const dimsCommon = {
+      const dimBase = {
         idCobrador: Number(cobradorUser.idCobrador ?? idCobrador) ?? null,
         performedBy: adminUserId,
         note: note || "",
@@ -655,23 +967,27 @@ export async function crearArqueoUsuario(req, res, next) {
         dateTo: dt || null,
         kind: "ARQUEO_MANUAL",
         idemKey,
-        fromUserId: cobradorUser._id,
-        toUserId: adminUserId,
       };
 
-      // Línea 1: CREDIT en CAJA_COBRADOR con userId = cobrador
+      // ⚠️ LÍNEA 1: CREDIT en CAJA_COBRADOR
+      // - userId = admin (ejecutor) para que el listado muestre Admin → Cobrador
+      // - vinculamos al cobrador por dimensions.idCobrador
       const creditOut = {
         paymentId: syntheticPaymentId,
-        userId: cobradorUser._id,
+        userId: adminUserId, // ← clave para naming correcto
         accountCode: "CAJA_COBRADOR",
         side: "credit",
         amount: balance,
         currency,
         postedAt: now,
-        dimensions: { ...dimsCommon },
+        dimensions: {
+          ...dimBase,
+          fromUserId: adminUserId, // dirección: Admin → Cobrador (vista)
+          toUserId: cobradorUser._id,
+        },
       };
 
-      // Línea 2: DEBIT en CAJA_ADMIN (u otra destino) con userId = admin
+      // LÍNEA 2: DEBIT en cuenta destino (p.ej. CAJA_ADMIN) con userId = admin
       const debitIn = {
         paymentId: syntheticPaymentId,
         userId: adminUserId,
@@ -680,7 +996,11 @@ export async function crearArqueoUsuario(req, res, next) {
         amount: balance,
         currency,
         postedAt: now,
-        dimensions: { ...dimsCommon },
+        dimensions: {
+          ...dimBase,
+          fromUserId: cobradorUser._id, // vista: Cobrador → Admin en CAJA_ADMIN (debit)
+          toUserId: adminUserId,
+        },
       };
 
       const entries = await LedgerEntry.insertMany([creditOut, debitIn], {
@@ -690,7 +1010,7 @@ export async function crearArqueoUsuario(req, res, next) {
       created.push({
         currency,
         balance,
-        from: { userId: cobradorUser._id, accountCode: "CAJA_COBRADOR" },
+        from: { userId: adminUserId, accountCode: "CAJA_COBRADOR" }, // (owner lógico mostrado)
         to: { userId: adminUserId, accountCode: destAcct },
         paymentId: syntheticPaymentId,
         entryIds: entries.map((e) => e._id),
@@ -740,20 +1060,22 @@ export async function listArqueoUsuarioClientes(req, res, next) {
     const sortDirParam = toDir(req.query.sortDir || req.query.order || "desc");
     const sortBy = SORTABLE.has(sortByParam) ? sortByParam : "createdAt";
 
-    // Resolver cobrador target
+    // Resolver cobrador target (userId -> idCobrador) o idCobrador directo
     let targetIdCobrador = null;
     if (req.query.userId) {
       const user = await User.findById(String(req.query.userId))
         .select("_id role idCobrador")
         .lean();
-      if (!user)
+      if (!user) {
         return res
           .status(404)
           .json({ ok: false, message: "Usuario no encontrado" });
+      }
       targetIdCobrador = Number(user.idCobrador);
     } else if (req.query.idCobrador != null) {
       targetIdCobrador = Number(req.query.idCobrador);
     }
+
     if (!Number.isFinite(targetIdCobrador)) {
       return res.json({
         ok: true,
@@ -790,10 +1112,9 @@ export async function listArqueoUsuarioClientes(req, res, next) {
 
     // Período actual
     const now = new Date();
-    const NOW_PERIOD = yyyymmAR(now);
-    const NOW_NUM = now.getFullYear() * 100 + (now.getMonth() + 1);
+    const NOW_PERIOD = yyyymmAR(now); // "YYYY-MM"
+    const NOW_NUM = now.getFullYear() * 100 + (now.getMonth() + 1); // YYYYMM numérico
 
-    // Proyección final
     const pipeline = [
       { $match: matchStage },
 
@@ -927,7 +1248,12 @@ export async function listArqueoUsuarioClientes(req, res, next) {
                 status: { $in: ["posted", "settled"] },
               },
             },
-            { $unwind: "$allocations" },
+            {
+              $unwind: {
+                path: "$allocations",
+                preserveNullAndEmptyArrays: true,
+              },
+            },
             {
               $group: {
                 _id: "$cliente.idCliente",
@@ -977,7 +1303,7 @@ export async function listArqueoUsuarioClientes(req, res, next) {
                   in: { $add: [{ $multiply: ["$$y", 100] }, "$$m"] },
                 },
               },
-              { $subtract: [NOW_NUM, 1] },
+              { $subtract: [NOW_NUM, 1] }, // si nunca pagó, consideramos "al mes anterior"
             ],
           },
         },
@@ -1004,7 +1330,7 @@ export async function listArqueoUsuarioClientes(req, res, next) {
               {
                 $or: [
                   { $gte: ["$billing.paidNow", "$billing.chargeNow"] },
-                  { $gt: ["$__maxNum", NOW_NUM] },
+                  { $gt: ["$__maxNum", NOW_NUM] }, // tiene meses por adelantado
                 ],
               },
               "paid",
@@ -1026,14 +1352,16 @@ export async function listArqueoUsuarioClientes(req, res, next) {
       ...(!FULL ? [{ $skip: (page - 1) * limit }, { $limit: limit }] : []),
     ];
 
+    // ⚠️ usar el modelo correcto: Cliente (no Client)
     const [items, totalRes] = await Promise.all([
-      Client.aggregate(pipeline).allowDiskUse(true),
-      Client.aggregate([
+      Cliente.aggregate(pipeline).allowDiskUse(true), // <- antes: Client.aggregate
+      Cliente.aggregate([
         { $match: matchStage },
         { $group: { _id: "$idCliente" } },
         { $count: "n" },
       ]),
     ]);
+
     const total = totalRes?.[0]?.n || 0;
 
     return res.json({
@@ -1047,27 +1375,23 @@ export async function listArqueoUsuarioClientes(req, res, next) {
       full: FULL ? 1 : 0,
     });
   } catch (err) {
+    // log útil para depurar en server
+    console.error("listArqueoUsuarioClientes error:", err);
     next(err);
   }
 }
-
-// ⬇️ NUEVO: CSV de clientes por cobrador (titulares agrupados, FULL EXPORT)
+// GET /api/admin/arqueos/usuarios/clientes-csv
 export async function exportCollectorClientsCSV(req, res, next) {
   try {
-    const qUserId = (req.query.userId || "").trim();
-    const qIdCobrador = (req.query.idCobrador || "").trim();
-    const activeOnly = String(req.query.activeOnly || "").trim() === "1";
+    const qUserId = String(req.query.userId || "").trim();
+    const qIdCobrador = String(req.query.idCobrador || "").trim();
+    const activeOnly = String(req.query.activeOnly || "") === "1";
 
-    // 1) Resolver idCobrador
+    // ── resolver idCobrador (cid)
     let cid = null;
     if (qIdCobrador) {
-      cid = String(qIdCobrador);
-    } else {
-      if (!qUserId) {
-        return res
-          .status(400)
-          .json({ ok: false, message: "Falta userId o idCobrador" });
-      }
+      cid = qIdCobrador;
+    } else if (qUserId) {
       const user = await User.findById(qUserId)
         .select("_id role idCobrador")
         .lean();
@@ -1079,29 +1403,88 @@ export async function exportCollectorClientsCSV(req, res, next) {
         return res.status(403).json({ ok: false, message: "Rol sin permisos" });
       }
       if (user.idCobrador == null || user.idCobrador === "") {
-        return res
-          .status(400)
-          .json({
-            ok: false,
-            message: "El usuario no tiene idCobrador asignado",
-          });
+        return res.status(400).json({
+          ok: false,
+          message: "El usuario no tiene idCobrador asignado",
+        });
       }
       cid = String(user.idCobrador);
+    } else {
+      return res
+        .status(400)
+        .json({ ok: false, message: "Falta userId o idCobrador" });
     }
 
-    // 2) Match base: TODOS los TITULARES del cobrador (sin activo por defecto)
-    const baseMatch = {
-      rol: "TITULAR",
-      $expr: { $eq: [{ $toString: "$idCobrador" }, cid] },
-      ...(activeOnly ? { activo: true } : {}),
-    };
+    // ── permisos: cobrador solo su propia cartera
+    const viewerRole = String(req.user?.role || "");
+    const viewerIdCobrador =
+      req.user?.idCobrador != null ? String(req.user.idCobrador) : null;
+    if (viewerRole === "cobrador") {
+      if (!viewerIdCobrador) {
+        return res
+          .status(403)
+          .json({ ok: false, message: "Cobrador sin idCobrador en sesión" });
+      }
+      if (viewerIdCobrador !== String(cid)) {
+        return res
+          .status(403)
+          .json({ ok: false, message: "No autorizado para este idCobrador" });
+      }
+    } else if (!["admin", "superAdmin"].includes(viewerRole)) {
+      return res
+        .status(403)
+        .json({ ok: false, message: "Permisos insuficientes" });
+    }
 
-    const rows = await Client.aggregate([
-      { $match: baseMatch },
+    // ── pipeline: TODOS los miembros del cobrador; agrupamos por grupo (idCliente)
+    const rows = await Cliente.aggregate([
+      // match por cobrador (sin rol)
+      {
+        $match: {
+          $expr: { $eq: [{ $toString: "$idCobrador" }, String(cid)] },
+        },
+      },
 
-      // Normalizaciones / defaults
+      // normalizaciones + flags
       {
         $addFields: {
+          __isActiveMember: {
+            $cond: [
+              {
+                $or: [
+                  { $eq: [{ $type: "$baja" }, "missing"] },
+                  { $eq: ["$baja", null] },
+                ],
+              },
+              { $cond: [{ $eq: ["$activo", false] }, false, true] },
+              false,
+            ],
+          },
+          // rank: prioriza TITULAR (case-insensitive), luego integrante 0, luego el resto
+          __rankTitular: {
+            $cond: [
+              {
+                $regexMatch: {
+                  input: { $ifNull: ["$rol", ""] },
+                  regex: /^titular$/i,
+                },
+              },
+              0,
+              1,
+            ],
+          },
+          __rankIntegrante: {
+            $cond: [
+              {
+                $and: [
+                  { $isNumber: "$integrante" },
+                  { $gte: ["$integrante", 0] },
+                ],
+              },
+              "$integrante",
+              9999,
+            ],
+          },
           telefonoStr: {
             $cond: [
               {
@@ -1132,46 +1515,48 @@ export async function exportCollectorClientsCSV(req, res, next) {
         },
       },
 
-      // Contar integrantes del grupo (si activeOnly=1, sólo activos; si no, todos)
+      // ordenar para elegir representante del grupo (TITULAR primero)
       {
-        $lookup: {
-          from: Client.collection.name,
-          let: { gid: "$idCliente" },
-          pipeline: [
-            {
-              $match: {
-                $expr: { $eq: ["$idCliente", "$$gid"] },
-                ...(activeOnly ? { activo: true } : {}), // 👈 opcional
-              },
-            },
-            { $count: "n" },
-          ],
-          as: "membersCount",
-        },
-      },
-      {
-        $addFields: {
-          integrantes: {
-            $ifNull: [{ $arrayElemAt: ["$membersCount.n", 0] }, 1],
-          },
+        $sort: {
+          idCliente: 1,
+          __rankTitular: 1,
+          __rankIntegrante: 1,
+          createdAt: 1,
+          _id: 1,
         },
       },
 
-      // Proyección final
+      // agrupar por grupo; contar activos para aplicar activeOnly
+      {
+        $group: {
+          _id: "$idCliente",
+          rep: { $first: "$$ROOT" },
+          activosEnGrupo: { $sum: { $cond: ["$__isActiveMember", 1, 0] } },
+        },
+      },
+
+      // si activeOnly=1, quedate solo con grupos que tengan al menos 1 activo
+      ...(activeOnly ? [{ $match: { activosEnGrupo: { $gt: 0 } } }] : []),
+
+      // proyección CSV
       {
         $project: {
           _id: 0,
-          idCliente: 1,
-          titular: { $ifNull: ["$nombre", ""] }, // nombre del documento TITULAR
-          documento: { $ifNull: ["$documento", ""] },
-          telefono: "$telefonoStr",
-          domicilio: { $ifNull: ["$domicilio", ""] },
-          ciudad: { $ifNull: ["$ciudad", ""] },
-          integrantes: 1,
-          cuota: "$cuotaNum",
-          cuotaIdeal: "$cuotaIdealNum",
+          idCliente: "$_id",
+          titular: { $ifNull: ["$rep.nombre", ""] },
+          documento: { $ifNull: ["$rep.documento", ""] },
+          telefono: "$rep.telefonoStr",
+          domicilio: { $ifNull: ["$rep.domicilio", ""] },
+          ciudad: { $ifNull: ["$rep.ciudad", ""] },
+          integrantes: "$activosEnGrupo",
+          cuota: "$rep.cuotaNum",
+          cuotaIdeal: "$rep.cuotaIdealNum",
           cuotaVigente: {
-            $cond: ["$usarIdealBool", "$cuotaIdealNum", "$cuotaNum"],
+            $cond: [
+              "$rep.usarIdealBool",
+              "$rep.cuotaIdealNum",
+              "$rep.cuotaNum",
+            ],
           },
         },
       },
@@ -1179,7 +1564,7 @@ export async function exportCollectorClientsCSV(req, res, next) {
       { $sort: { titular: 1, idCliente: 1 } },
     ]).allowDiskUse(true);
 
-    // 3) CSV con BOM
+    // ── CSV
     const headers = [
       "idCliente",
       "Titular",
@@ -1228,6 +1613,373 @@ export async function exportCollectorClientsCSV(req, res, next) {
     res.setHeader("Content-Type", "text/csv; charset=utf-8");
     res.setHeader("Content-Disposition", `attachment; filename="${filename}"`);
     return res.status(200).send(csv);
+  } catch (err) {
+    next(err);
+  }
+}
+
+/**
+ * POST /api/caja/chica/deposito
+ * body: { adminUserId, currency?, note? }
+ * Permisos: admin (sobre sí mismo) o superAdmin (sobre cualquier admin)
+ * Lógica: mueve TODO el saldo de CAJA_ADMIN → CAJA_CHICA del admin.
+ */
+export async function depositoCajaChica(req, res, next) {
+  try {
+    const { adminUserId, currency = "ARS", note = "" } = req.body || {};
+    if (!adminUserId) {
+      return res.status(400).json({ ok: false, message: "Falta adminUserId" });
+    }
+
+    const admin = await User.findById(adminUserId).select("_id role").lean();
+    if (!admin || admin.role !== "admin") {
+      return res
+        .status(400)
+        .json({ ok: false, message: "adminUserId inválido" });
+    }
+
+    // Seguridad: el propio admin o un superAdmin
+    const viewerRole = String(req.user?.role || "");
+    const isSelf = String(req.user?._id) === String(admin._id);
+    if (!(isSelf || viewerRole === "superAdmin")) {
+      return res.status(403).json({ ok: false, message: "Sin permisos" });
+    }
+
+    // 👉 Mover TODO el saldo de CAJA_ADMIN
+    const saldoAdmin = await getBalance({
+      userId: admin._id,
+      accountCode: DEST_DEFAULT, // CAJA_ADMIN
+      currency,
+    });
+
+    const amount = Number(saldoAdmin || 0);
+    if (amount <= 0) {
+      return res.status(409).json({
+        ok: false,
+        message: "No hay saldo disponible en CAJA_ADMIN para mover.",
+        balance: saldoAdmin,
+      });
+    }
+
+    const out = await createLedgerTransfer({
+      from: { userId: admin._id, accountCode: DEST_DEFAULT }, // CAJA_ADMIN
+      to: { userId: admin._id, accountCode: CAJA_CHICA },
+      amount,
+      currency,
+      kind: "CAJA_CHICA_DEPOSITO_ALL",
+      note,
+      idemScope: `ALL:${admin._id}`,
+      extraDims: { performedBy: req.user?._id || null },
+    });
+
+    return res.status(201).json({ ok: true, movedAll: true, amount, ...out });
+  } catch (err) {
+    next(err);
+  }
+}
+
+/**
+ * POST /api/caja/grande/ingreso
+ * body: { amount?, moveAll?, currency="ARS", toSuperAdminUserId? }
+ * Permisos: sólo superAdmin
+ * Lógica: desde CAJA_CHICA (GLOBAL) → CAJA_GRANDE (del SA). Monto o TODO.
+ */
+export async function ingresoCajaGrande(req, res, next) {
+  try {
+    if (String(req.user?.role || "") !== "superAdmin") {
+      return res.status(403).json({ ok: false, message: "Sólo superAdmin" });
+    }
+
+    const {
+      amount: amountRaw,
+      moveAll,
+      currency = "ARS",
+      toSuperAdminUserId,
+      note = "",
+    } = req.body || {};
+
+    // Dueño de la bóveda (CAJA_GRANDE)
+    const vaultOwnerId = toSuperAdminUserId || req.user._id;
+    const sa = await User.findById(vaultOwnerId).select("_id role").lean();
+    if (!sa || sa.role !== "superAdmin") {
+      return res
+        .status(400)
+        .json({ ok: false, message: "toSuperAdminUserId inválido" });
+    }
+
+    // 1) Sumar CHICA como GLOBAL: por accountCode+currency, sin filtrar userId
+    const byAdmin = await LedgerEntry.aggregate([
+      { $match: { accountCode: CAJA_CHICA, currency } },
+      { $group: { _id: "$userId", debits: debitExpr, credits: creditExpr } },
+      {
+        $project: {
+          userId: "$_id",
+          _id: 0,
+          balance: { $subtract: ["$debits", "$credits"] },
+        },
+      },
+      { $match: { balance: { $gt: 0 } } },
+      { $sort: { balance: -1 } }, // dreno simple: primero el que más tiene
+    ]);
+
+    const totalAvailable = byAdmin.reduce(
+      (acc, it) => acc + Number(it.balance || 0),
+      0
+    );
+
+    let requested = Number(amountRaw);
+    const wantAll = String(moveAll || "") === "1" || !Number(requested);
+    if (wantAll) requested = totalAvailable;
+
+    if (!Number.isFinite(requested) || requested <= 0) {
+      return res.status(409).json({
+        ok: false,
+        message: "No hay saldo disponible en CAJA_CHICA (GLOBAL) para mover.",
+        available: totalAvailable,
+        requestedAll: wantAll ? 1 : 0,
+      });
+    }
+    if (requested > totalAvailable + 1e-9) {
+      return res.status(409).json({
+        ok: false,
+        message: `El monto solicitado excede el saldo en CAJA_CHICA (GLOBAL).`,
+        available: totalAvailable,
+        requested,
+      });
+    }
+
+    // 2) Transferir CHICA(admin) -> GRANDE(SA) hasta cubrir 'requested'
+    let remaining = requested;
+    const transfers = []; // no exponemos nombres; sólo guardamos ids/montos si querés audit
+    for (const it of byAdmin) {
+      if (remaining <= 0) break;
+      const move = Math.min(remaining, Number(it.balance || 0));
+      if (move <= 0) continue;
+
+      const out = await createLedgerTransfer({
+        from: { userId: it.userId, accountCode: CAJA_CHICA },
+        to: { userId: sa._id, accountCode: CAJA_GRANDE },
+        amount: move,
+        currency,
+        kind: wantAll ? "CAJA_GRANDE_INGRESO_ALL" : "CAJA_GRANDE_INGRESO",
+        note,
+        extraDims: { performedBy: req.user._id, scope: "GLOBAL_CHICA" },
+        idemScope: `CHICA_AGREGADA->GRANDE:${String(
+          sa._id
+        )}:${currency}:${move}:${String(it.userId)}`,
+      });
+
+      transfers.push({ moved: move, id: out?.id || null });
+      remaining -= move;
+    }
+
+    return res.status(201).json({
+      ok: true,
+      movedAll: wantAll,
+      amount: requested,
+      currency,
+      transfersCount: transfers.length,
+    });
+  } catch (err) {
+    next(err);
+  }
+}
+
+/**
+ * POST /api/caja/grande/extraccion
+ * body: { amount?, moveAll?, currency?, note?, superAdminUserId? }
+ * Permisos: sólo superAdmin
+ * Lógica: si moveAll=1 (o no se pasa amount), mueve TODO desde CAJA_GRANDE → CAJA_SUPERADMIN del SA.
+ */
+export async function extraccionCajaGrande(req, res, next) {
+  try {
+    const role = String(req.user?.role || "");
+    if (role !== "superAdmin") {
+      return res.status(403).json({ ok: false, message: "Sólo superAdmin" });
+    }
+
+    const {
+      amount: amountRaw,
+      moveAll,
+      currency = "ARS",
+      note = "",
+      superAdminUserId,
+    } = req.body || {};
+
+    const ownerId = superAdminUserId || req.user._id;
+    const sa = await User.findById(ownerId).select("_id role").lean();
+    if (!sa || sa.role !== "superAdmin") {
+      return res
+        .status(400)
+        .json({ ok: false, message: "superAdminUserId inválido" });
+    }
+
+    let amount = Number(amountRaw);
+    const shouldMoveAll = String(moveAll || "") === "1" || !Number(amount);
+
+    if (shouldMoveAll) {
+      const saldoGrande = await getBalance({
+        userId: sa._id,
+        accountCode: CAJA_GRANDE,
+        currency,
+      });
+      amount = Number(saldoGrande || 0);
+    }
+
+    if (!Number.isFinite(amount) || amount <= 0) {
+      return res.status(409).json({
+        ok: false,
+        message: "No hay saldo disponible en CAJA_GRANDE para extraer.",
+        requestedAll: shouldMoveAll ? 1 : 0,
+      });
+    }
+
+    const out = await createLedgerTransfer({
+      from: { userId: sa._id, accountCode: CAJA_GRANDE },
+      to: { userId: sa._id, accountCode: CAJA_SUPERADMIN },
+      amount,
+      currency,
+      kind: shouldMoveAll
+        ? "CAJA_GRANDE_EXTRACCION_ALL"
+        : "CAJA_GRANDE_EXTRACCION",
+      note,
+      extraDims: { performedBy: req.user._id },
+      idemScope: `${shouldMoveAll ? "ALL:" : ""}${sa._id}`,
+    });
+
+    return res.status(201).json({
+      ok: true,
+      movedAll: shouldMoveAll ? true : false,
+      amount,
+      ...out,
+    });
+  } catch (err) {
+    next(err);
+  }
+}
+
+export async function getGlobalCajasBalance(req, res, next) {
+  try {
+    // Sólo superAdmin puede ver globales
+    if (String(req.user?.role || "") !== "superAdmin") {
+      return res.status(403).json({ ok: false, message: "Sólo superAdmin" });
+    }
+
+    const fromDt = parseISODate(req.query.dateFrom);
+    const toDt = parseISODate(req.query.dateTo, true);
+
+    // CAJA_GRANDE global = todas las entradas con accountCode CAJA_GRANDE (cualquier userId)
+    // CAJA_CHICA  global = todas las entradas con accountCode CAJA_CHICA  (cualquier userId)
+    const matchBase = (acc) => ({
+      accountCode: acc,
+      ...(fromDt || toDt
+        ? {
+            postedAt: {
+              ...(fromDt ? { $gte: fromDt } : {}),
+              ...(toDt ? { $lte: toDt } : {}),
+            },
+          }
+        : {}),
+    });
+
+    const [grandeAgg, chicaAgg] = await Promise.all([
+      LedgerEntry.aggregate([
+        { $match: matchBase(CAJA_GRANDE) },
+        { $group: { _id: null, debits: debitExpr, credits: creditExpr } },
+        {
+          $project: { _id: 0, balance: { $subtract: ["$debits", "$credits"] } },
+        },
+      ]),
+      LedgerEntry.aggregate([
+        { $match: matchBase(CAJA_CHICA) },
+        { $group: { _id: null, debits: debitExpr, credits: creditExpr } },
+        {
+          $project: { _id: 0, balance: { $subtract: ["$debits", "$credits"] } },
+        },
+      ]),
+    ]);
+
+    const balances = {
+      CAJA_GRANDE: Number(grandeAgg?.[0]?.balance || 0),
+      CAJA_CHICA: Number(chicaAgg?.[0]?.balance || 0),
+    };
+
+    return res.json({
+      ok: true,
+      balances,
+      dateFrom: req.query.dateFrom || null,
+      dateTo: req.query.dateTo || null,
+    });
+  } catch (err) {
+    next(err);
+  }
+}
+export async function getArqueoGlobalTotals(req, res, next) {
+  try {
+    const accts = String(req.query.accountCodes || "")
+      .split(",")
+      .map((s) => s.trim())
+      .filter(Boolean);
+
+    if (!accts.length) {
+      return res
+        .status(400)
+        .json({ ok: false, message: "accountCodes requerido" });
+    }
+
+    const fromDt = parseISODate(req.query.dateFrom);
+    const toDt = parseISODate(req.query.dateTo, true);
+
+    const match = {
+      accountCode: { $in: accts },
+      ...(fromDt || toDt
+        ? {
+            postedAt: {
+              ...(fromDt ? { $gte: fromDt } : {}),
+              ...(toDt ? { $lte: toDt } : {}),
+            },
+          }
+        : {}),
+    };
+
+    const [totals] = await LedgerEntry.aggregate([
+      { $match: match },
+      {
+        $group: {
+          _id: null,
+          debits: debitExpr,
+          credits: creditExpr,
+          lastMovementAt: { $max: "$postedAt" },
+          paymentsSet: { $addToSet: "$paymentId" },
+        },
+      },
+      {
+        $project: {
+          _id: 0,
+          debits: 1,
+          credits: 1,
+          balance: { $subtract: ["$debits", "$credits"] },
+          lastMovementAt: 1,
+          paymentsCount: { $size: "$paymentsSet" },
+        },
+      },
+    ]);
+
+    res.json({
+      ok: true,
+      totals: totals || {
+        debits: 0,
+        credits: 0,
+        balance: 0,
+        lastMovementAt: null,
+        paymentsCount: 0,
+      },
+      filters: {
+        accountCodes: accts,
+        dateFrom: req.query.dateFrom || null,
+        dateTo: req.query.dateTo || null,
+      },
+    });
   } catch (err) {
     next(err);
   }

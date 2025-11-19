@@ -1,12 +1,23 @@
 // src/routes/admin-arqueos.routes.js
 import { Router } from "express";
-import { requireSession, adminOnly } from "../middlewares/roles.js";
+import {
+  requireSession,
+  adminOnly,
+  superAdminOnly,
+} from "../middlewares/roles.js";
 import {
   listArqueosUsuarios,
   getArqueoUsuarioDetalle,
   listArqueoUsuarioClientes, // JSON listado de clientes por cobrador
   crearArqueoUsuario, // Crear arqueo/corte manual
-  exportCollectorClientsCSV, // ⬅️ NUEVO: CSV de clientes por cobrador
+  exportCollectorClientsCSV, // CSV de clientes por cobrador
+
+  // ➕ NUEVOS controladores de caja chica / grande
+  depositoCajaChica, // admin → su CAJA_CHICA
+  ingresoCajaGrande, // superAdmin: CAJA_CHICA (admin) → CAJA_GRANDE (SA)
+  extraccionCajaGrande, // superAdmin: CAJA_GRANDE → CAJA_SUPERADMIN
+  getGlobalCajasBalance,
+  getArqueoGlobalTotals,
 } from "../controllers/admin-arqueos.controller.js";
 
 const router = Router();
@@ -66,4 +77,54 @@ router.post(
   crearArqueoUsuario
 );
 
+/* =========================================================================
+ *  NUEVAS RUTAS — Caja chica / Caja grande
+ * ========================================================================= */
+
+/**
+ * Depósito a CAJA_CHICA (admin sobre sí mismo o superAdmin sobre cualquier admin)
+ * POST /api/admin/caja/chica/deposito
+ */
+router.post(
+  "/admin/caja/chica/deposito",
+  requireSession,
+  adminOnly, // permite admin y superAdmin
+  depositoCajaChica
+);
+
+/**
+ * Ingreso a CAJA_GRANDE (mueve desde CAJA_CHICA de un admin)
+ * Sólo superAdmin
+ * POST /api/admin/caja/grande/ingreso
+ */
+router.post(
+  "/admin/caja/grande/ingreso",
+  requireSession,
+  superAdminOnly,
+  ingresoCajaGrande
+);
+
+/**
+ * Extracción desde CAJA_GRANDE hacia CAJA_SUPERADMIN (billetera SA)
+ * Sólo superAdmin
+ * POST /api/admin/caja/grande/extraccion
+ */
+router.post(
+  "/admin/caja/grande/extraccion",
+  requireSession,
+  superAdminOnly,
+  extraccionCajaGrande
+);
+router.get(
+  "/admin/arqueos/global-cajas-balance",
+  requireSession,
+  adminOnly,
+  getGlobalCajasBalance
+);
+router.get(
+  "/admin/arqueos/global-totals",
+  requireSession,
+  adminOnly, // o superAdminOnly si querés restringirlo
+  getArqueoGlobalTotals
+);
 export default router;

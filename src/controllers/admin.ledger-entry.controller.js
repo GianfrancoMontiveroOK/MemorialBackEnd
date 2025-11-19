@@ -73,6 +73,8 @@ export async function listAdminLedgerEntries(req, res) {
     const _skip = (_page - 1) * _limit;
 
     const matchAnd = [];
+
+    // rango de fechas
     if (dateFrom) {
       const d = new Date(dateFrom);
       if (!Number.isNaN(d.getTime())) matchAnd.push({ postedAt: { $gte: d } });
@@ -92,6 +94,8 @@ export async function listAdminLedgerEntries(req, res) {
         matchAnd.push({ postedAt: { $lte: e } });
       }
     }
+
+    // filtros básicos
     if (side === "debit" || side === "credit") matchAnd.push({ side });
     const _accountCode = accountCode || account;
     if (_accountCode) matchAnd.push({ accountCode: _accountCode });
@@ -100,6 +104,7 @@ export async function listAdminLedgerEntries(req, res) {
     const _idCob = toInt(idCobrador);
     if (Number.isFinite(_idCob))
       matchAnd.push({ "dimensions.idCobrador": _idCob });
+
     const _idCli = toInt(idCliente);
     if (Number.isFinite(_idCli))
       matchAnd.push({ "dimensions.idCliente": _idCli });
@@ -116,6 +121,17 @@ export async function listAdminLedgerEntries(req, res) {
       matchAnd.push({ userId: new mongoose.Types.ObjectId(userId) });
     }
 
+    // ⛔️ Seguridad por rol del viewer
+    const viewerRole = String(req.user?.role || "").trim();
+    if (viewerRole === "admin") {
+      matchAnd.push({
+        $nor: [
+          { $and: [{ accountCode: "CAJA_GRANDE" }, { side: "credit" }] },
+          { accountCode: "CAJA_SUPERADMIN" },
+        ],
+      });
+    }
+
     const includePaymentFlag = toBool(includePayment, false);
     const needPaymentJoin = includePaymentFlag || !!method || !!status;
 
@@ -126,7 +142,7 @@ export async function listAdminLedgerEntries(req, res) {
     const pipeline = [];
     if (Object.keys(baseMatch).length) pipeline.push({ $match: baseMatch });
 
-    // Ejecutor (userId -> users)
+    // Lookups
     pipeline.push({
       $lookup: {
         from: User.collection.name,
@@ -139,7 +155,6 @@ export async function listAdminLedgerEntries(req, res) {
       },
     });
 
-    // Cobrador (dimensions.idCobrador -> users.idCobrador STRING)
     pipeline.push({
       $lookup: {
         from: User.collection.name,
@@ -162,7 +177,6 @@ export async function listAdminLedgerEntries(req, res) {
       },
     });
 
-    // Cliente titular (idCliente -> clientes TITULAR)
     pipeline.push({
       $lookup: {
         from: Cliente.collection.name,
@@ -205,7 +219,7 @@ export async function listAdminLedgerEntries(req, res) {
       if (after.length) pipeline.push({ $match: { $and: after } });
     }
 
-    // Nombres cacheados + flags robustos
+    // Nombres base + flags
     pipeline.push({
       $addFields: {
         _adminName: { $ifNull: [{ $first: "$execUser.name" }, "CAJA_ADMIN"] },
@@ -253,7 +267,6 @@ export async function listAdminLedgerEntries(req, res) {
             },
           ],
         },
-        // ⚠️ clave: detectar AUSENCIA real de idCliente (missing o null)
         _hasCliente: {
           $cond: [
             { $in: [{ $type: "$dimensions.idCliente" }, ["missing", "null"]] },
@@ -264,27 +277,79 @@ export async function listAdminLedgerEntries(req, res) {
       },
     });
 
-    // Reglas (con el caso problemático PRIMERO)
+    // Reglas FROM/TO (tus fixes incluidos)
+    const G_CHICA = "CAJA_CHICA (GLOBAL)";
+    const G_GRANDE = "CAJA_GRANDE (GLOBAL)";
+    const G_SUPERADMIN = "CAJA_SUPERADMIN";
+
     pipeline.push({
       $addFields: {
-        // FROM
         fromUserName: {
           $switch: {
             branches: [
-              // *** FIX PRIORITARIO ***
-              // CAJA_COBRADOR • CREDIT • sin cliente  => ADMIN → COBRADOR
+              {
+                case: {
+                  $and: [
+                    { $eq: ["$accountCode", "CAJA_ADMIN"] },
+                    { $eq: ["$side", "credit"] },
+                  ],
+                },
+                then: G_CHICA,
+              },
+              {
+                case: {
+                  $and: [
+                    { $eq: ["$accountCode", "CAJA_CHICA"] },
+                    { $eq: ["$side", "debit"] },
+                  ],
+                },
+                then: { $ifNull: ["$_adminName", "CAJA_ADMIN"] },
+              },
+              {
+                case: {
+                  $and: [
+                    { $eq: ["$accountCode", "CAJA_CHICA"] },
+                    { $eq: ["$side", "credit"] },
+                  ],
+                },
+                then: G_GRANDE,
+              },
+              {
+                case: {
+                  $and: [
+                    { $eq: ["$accountCode", "CAJA_GRANDE"] },
+                    { $eq: ["$side", "debit"] },
+                  ],
+                },
+                then: G_CHICA,
+              },
+              {
+                case: {
+                  $and: [
+                    { $eq: ["$accountCode", "CAJA_GRANDE"] },
+                    { $eq: ["$side", "credit"] },
+                  ],
+                },
+                then: G_SUPERADMIN,
+              },
+              {
+                case: {
+                  $and: [
+                    { $eq: ["$accountCode", "CAJA_SUPERADMIN"] },
+                    { $eq: ["$side", "debit"] },
+                  ],
+                },
+                then: G_GRANDE,
+              },
               {
                 case: {
                   $and: [
                     { $eq: ["$accountCode", "CAJA_COBRADOR"] },
                     { $eq: ["$side", "credit"] },
-                    { $eq: ["$_hasCliente", false] },
                   ],
                 },
                 then: { $ifNull: ["$_adminName", "CAJA_ADMIN"] },
               },
-
-              // INGRESOS_CUOTAS (CR): cobrador → cliente
               {
                 case: {
                   $and: [
@@ -294,8 +359,6 @@ export async function listAdminLedgerEntries(req, res) {
                 },
                 then: { $ifNull: ["$_cobradorName", "$_adminName"] },
               },
-
-              // CAJA_ADMIN (DE): cobrador → admin
               {
                 case: {
                   $and: [
@@ -305,8 +368,6 @@ export async function listAdminLedgerEntries(req, res) {
                 },
                 then: { $ifNull: ["$_cobradorName", "$_adminName"] },
               },
-
-              // CAJA_COBRADOR (DE) sin cliente: admin → cobrador
               {
                 case: {
                   $and: [
@@ -317,8 +378,6 @@ export async function listAdminLedgerEntries(req, res) {
                 },
                 then: { $ifNull: ["$_adminName", "CAJA_ADMIN"] },
               },
-
-              // CAJA_COBRADOR (DE) con cliente: cliente → cobrador
               {
                 case: {
                   $and: [
@@ -339,25 +398,72 @@ export async function listAdminLedgerEntries(req, res) {
             },
           },
         },
-
-        // TO
         toUserName: {
           $switch: {
             branches: [
-              // *** FIX PRIORITARIO ***
-              // CAJA_COBRADOR • CREDIT • sin cliente  => ADMIN → COBRADOR
+              {
+                case: {
+                  $and: [
+                    { $eq: ["$accountCode", "CAJA_ADMIN"] },
+                    { $eq: ["$side", "credit"] },
+                  ],
+                },
+                then: { $ifNull: ["$_adminName", "CAJA_ADMIN"] },
+              },
+              {
+                case: {
+                  $and: [
+                    { $eq: ["$accountCode", "CAJA_CHICA"] },
+                    { $eq: ["$side", "debit"] },
+                  ],
+                },
+                then: G_CHICA,
+              },
+              {
+                case: {
+                  $and: [
+                    { $eq: ["$accountCode", "CAJA_CHICA"] },
+                    { $eq: ["$side", "credit"] },
+                  ],
+                },
+                then: G_CHICA,
+              },
+              {
+                case: {
+                  $and: [
+                    { $eq: ["$accountCode", "CAJA_GRANDE"] },
+                    { $eq: ["$side", "debit"] },
+                  ],
+                },
+                then: G_GRANDE,
+              },
+              {
+                case: {
+                  $and: [
+                    { $eq: ["$accountCode", "CAJA_GRANDE"] },
+                    { $eq: ["$side", "credit"] },
+                  ],
+                },
+                then: G_GRANDE,
+              },
+              {
+                case: {
+                  $and: [
+                    { $eq: ["$accountCode", "CAJA_SUPERADMIN"] },
+                    { $eq: ["$side", "debit"] },
+                  ],
+                },
+                then: { $ifNull: ["$_adminName", G_SUPERADMIN] },
+              },
               {
                 case: {
                   $and: [
                     { $eq: ["$accountCode", "CAJA_COBRADOR"] },
                     { $eq: ["$side", "credit"] },
-                    { $eq: ["$_hasCliente", false] },
                   ],
                 },
                 then: { $ifNull: ["$_cobradorName", "COBRADOR"] },
               },
-
-              // INGRESOS_CUOTAS (CR): cobrador → cliente
               {
                 case: {
                   $and: [
@@ -367,8 +473,6 @@ export async function listAdminLedgerEntries(req, res) {
                 },
                 then: { $ifNull: ["$_clienteName", "$_adminName"] },
               },
-
-              // CAJA_ADMIN (DE): cobrador → admin
               {
                 case: {
                   $and: [
@@ -378,8 +482,6 @@ export async function listAdminLedgerEntries(req, res) {
                 },
                 then: { $ifNull: ["$_adminName", "CAJA_ADMIN"] },
               },
-
-              // CAJA_COBRADOR (DE) sin cliente: admin → cobrador
               {
                 case: {
                   $and: [
@@ -390,8 +492,6 @@ export async function listAdminLedgerEntries(req, res) {
                 },
                 then: { $ifNull: ["$_cobradorName", "COBRADOR"] },
               },
-
-              // CAJA_COBRADOR (DE) con cliente: cliente → cobrador
               {
                 case: {
                   $and: [
@@ -440,6 +540,7 @@ export async function listAdminLedgerEntries(req, res) {
     const finalProject = {
       _id: 1,
       paymentId: 1,
+      kind: 1,
       side: 1,
       accountCode: 1,
       amount: 1,
