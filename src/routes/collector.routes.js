@@ -6,6 +6,7 @@ import {
   listCollectorClients,
   getCollectorClientById,
   getCollectorClientDebt,
+  getCollectorSummary,
 } from "../controllers/collector.clients.controller.js";
 
 // Pagos (transaccional)
@@ -121,6 +122,15 @@ router.get(
   ensureCollectorLoaded,
   cobradorOnly,
   streamCollectorReceiptPdf
+);
+
+router.get(
+  "/summary",
+  requireSession,
+  ensureUserLoaded,
+  ensureCollectorLoaded, // setea req.user.idCobrador
+  cobradorOnly,
+  getCollectorSummary
 );
 
 export default router;

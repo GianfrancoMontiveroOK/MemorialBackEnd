@@ -8,7 +8,7 @@ const toObjectId = (v) =>
 
 /** Campos seguros a retornar (tu toJSON ya limpia, igual acotamos) */
 const SAFE_SELECT =
-  "email name role emailVerified idCobrador idVendedor createdAt updatedAt";
+  "email name role emailVerified idCobrador idVendedor createdAt updatedAt porcentajeCobrador commissionGraceDays commissionPenaltyPerDay";
 
 /** Normaliza un rol a la forma EXACTA del enum del modelo */
 const ALLOWED_ROLES = [
@@ -57,6 +57,7 @@ export const listUsers = async (req, res) => {
       "name",
       "email",
       "role",
+      "porcentajeCobrador", // ⬅️ ahora también podés ordenar por esto si querés
     ]);
     const _sortBy = SORT_ALLOWLIST.has(req.query.sortBy)
       ? req.query.sortBy
@@ -82,12 +83,26 @@ export const listUsers = async (req, res) => {
     const finalFilter =
       guards.length > 0 ? { $and: [baseFilter, ...guards] } : baseFilter;
 
+    // ⬇️ armamos el select agregando los campos nuevos de forma segura
+    const extraFields = {
+      idCobrador: 1,
+      idVendedor: 1,
+      porcentajeCobrador: 1,
+      commissionGraceDays: 1,
+      commissionPenaltyPerDay: 1,
+    };
+
     const [items, total] = await Promise.all([
       User.find(finalFilter)
         .sort({ [_sortBy]: _sortDir, _id: -1 })
         .skip((page - 1) * limit)
         .limit(limit)
-        .select(SAFE_SELECT) // tu select seguro actual
+        .select(
+          typeof SAFE_SELECT === "string"
+            ? SAFE_SELECT +
+                " idCobrador idVendedor porcentajeCobrador commissionGraceDays commissionPenaltyPerDay"
+            : { ...SAFE_SELECT, ...extraFields }
+        )
         .lean(),
       User.countDocuments(finalFilter),
     ]);
@@ -109,7 +124,6 @@ export const listUsers = async (req, res) => {
   }
 };
 
-/** GET /users/recent  -> últimos creados */
 export const listRecentUsers = async (req, res) => {
   try {
     const limit = Math.min(Number(req.query.limit) || 10, 100);
@@ -128,7 +142,6 @@ export const listRecentUsers = async (req, res) => {
   }
 };
 
-/** GET /users/:id */
 export const getUserById = async (req, res) => {
   try {
     const { id } = req.params;
@@ -150,7 +163,6 @@ export const getUserById = async (req, res) => {
   }
 };
 
-/** PUT /users/:id  -> actualización general (sin password) */
 export const updateUser = async (req, res) => {
   try {
     const { id } = req.params;
@@ -192,7 +204,6 @@ export const updateUser = async (req, res) => {
   }
 };
 
-/** PATCH /users/:id/role -> { role } (enum: superAdmin|admin|user|client) */
 export const setUserRole = async (req, res) => {
   try {
     const { id } = req.params;
@@ -253,14 +264,6 @@ export const setUserRole = async (req, res) => {
         .status(403)
         .json({ ok: false, message: "Sin permisos para cambiar roles." });
     }
-
-    // (Opcional) Evitar dejar el sistema sin superAdmins:
-    // if (target.role === "superAdmin" && role !== "superAdmin" && viewerRole === "superAdmin") {
-    //   const countSAs = await User.countDocuments({ role: "superAdmin", _id: { $ne: targetId } });
-    //   if (countSAs <= 0) {
-    //     return res.status(409).json({ ok: false, message: "Debe quedar al menos un superAdmin." });
-    //   }
-    // }
 
     const updated = await User.findByIdAndUpdate(
       targetId,
@@ -343,17 +346,6 @@ export const setUserCobrador = async (req, res, next) => {
       ? { $unset: { idCobrador: "" } }
       : { $set: { idCobrador: idCobrador.trim() } };
 
-    // (Opcional) Enforce unicidad de idCobrador:
-    // if (!isNullish) {
-    //   const exists = await User.exists({
-    //     _id: { $ne: targetId },
-    //     idCobrador: idCobrador.trim(),
-    //   });
-    //   if (exists) {
-    //     return res.status(409).json({ ok: false, message: "idCobrador ya asignado a otro usuario." });
-    //   }
-    // }
-
     const updated = await User.findByIdAndUpdate(targetId, update, {
       new: true,
     })
@@ -432,17 +424,6 @@ export const setUserVendedor = async (req, res, next) => {
       ? { $unset: { idVendedor: "" } }
       : { $set: { idVendedor: idVendedor.trim() } };
 
-    // (Opcional) Enforce unicidad de idVendedor:
-    // if (!isNullish) {
-    //   const exists = await User.exists({
-    //     _id: { $ne: targetId },
-    //     idVendedor: idVendedor.trim(),
-    //   });
-    //   if (exists) {
-    //     return res.status(409).json({ ok: false, message: "idVendedor ya asignado a otro usuario." });
-    //   }
-    // }
-
     const updated = await User.findByIdAndUpdate(targetId, update, {
       new: true,
     })
@@ -452,5 +433,172 @@ export const setUserVendedor = async (req, res, next) => {
     return res.json({ ok: true, item: updated });
   } catch (err) {
     next(err);
+  }
+};
+
+// ⬇️ COMISIONES DE COBRADOR
+
+// PATCH /users/:id/collector-commission
+export const setCollectorCommission = async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    // Puede venir como collectorCommissionPct (nuevo) o porcentajeCobrador (viejo)
+    const { collectorCommissionPct, porcentajeCobrador } = req.body;
+    const rawValue =
+      collectorCommissionPct !== undefined
+        ? collectorCommissionPct
+        : porcentajeCobrador;
+
+    // Validación básica de ID (24 chars hex)
+    if (!id || !/^[0-9a-fA-F]{24}$/.test(id)) {
+      return res
+        .status(400)
+        .json({ ok: false, message: "ID de usuario inválido." });
+    }
+
+    const update = {};
+
+    // Si viene vacío / null / undefined → limpiar campo con $unset
+    if (rawValue === "" || rawValue === null || rawValue === undefined) {
+      update.$unset = { porcentajeCobrador: 1 };
+    } else {
+      const n = Number(rawValue);
+      if (!Number.isFinite(n)) {
+        return res.status(400).json({
+          ok: false,
+          message: "porcentajeCobrador debe ser un número.",
+        });
+      }
+      if (n < 0 || n > 100) {
+        return res.status(400).json({
+          ok: false,
+          message: "porcentajeCobrador debe estar entre 0 y 100.",
+        });
+      }
+      update.$set = { porcentajeCobrador: n };
+    }
+
+    const updated = await User.findByIdAndUpdate(id, update, {
+      new: true,
+      runValidators: true,
+    }).lean();
+
+    if (!updated) {
+      return res
+        .status(404)
+        .json({ ok: false, message: "Usuario no encontrado." });
+    }
+
+    return res.json({
+      ok: true,
+      item: updated,
+    });
+  } catch (err) {
+    console.error("setCollectorCommission error:", err);
+    return res.status(500).json({
+      ok: false,
+      message: "Error actualizando la comisión del cobrador.",
+    });
+  }
+};
+
+// PATCH /users/:id/collector-commission-grace-days
+export const setCollectorCommissionGraceDays = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { graceDays } = req.body;
+
+    if (!id || !/^[0-9a-fA-F]{24}$/.test(id)) {
+      return res
+        .status(400)
+        .json({ ok: false, message: "ID de usuario inválido." });
+    }
+
+    const update = {};
+
+    if (graceDays === "" || graceDays === null || graceDays === undefined) {
+      update.$unset = { commissionGraceDays: 1 };
+    } else {
+      const n = Number(graceDays);
+      if (!Number.isFinite(n) || n < 0) {
+        return res.status(400).json({
+          ok: false,
+          message: "graceDays debe ser un número mayor o igual a 0.",
+        });
+      }
+      update.$set = { commissionGraceDays: Math.round(n) };
+    }
+
+    const updated = await User.findByIdAndUpdate(id, update, {
+      new: true,
+      runValidators: true,
+    }).lean();
+
+    if (!updated) {
+      return res
+        .status(404)
+        .json({ ok: false, message: "Usuario no encontrado." });
+    }
+
+    return res.json({ ok: true, item: updated });
+  } catch (err) {
+    console.error("setCollectorCommissionGraceDays error:", err);
+    return res.status(500).json({
+      ok: false,
+      message: "Error actualizando los días de gracia del cobrador.",
+    });
+  }
+};
+
+// PATCH /users/:id/collector-commission-penalty
+export const setCollectorCommissionPenaltyPerDay = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { penaltyPerDay } = req.body;
+
+    if (!id || !/^[0-9a-fA-F]{24}$/.test(id)) {
+      return res
+        .status(400)
+        .json({ ok: false, message: "ID de usuario inválido." });
+    }
+
+    const update = {};
+
+    if (
+      penaltyPerDay === "" ||
+      penaltyPerDay === null ||
+      penaltyPerDay === undefined
+    ) {
+      update.$unset = { commissionPenaltyPerDay: 1 };
+    } else {
+      const n = Number(penaltyPerDay);
+      if (!Number.isFinite(n) || n < 0) {
+        return res.status(400).json({
+          ok: false,
+          message: "penaltyPerDay debe ser un número mayor o igual a 0.",
+        });
+      }
+      update.$set = { commissionPenaltyPerDay: n };
+    }
+
+    const updated = await User.findByIdAndUpdate(id, update, {
+      new: true,
+      runValidators: true,
+    }).lean();
+
+    if (!updated) {
+      return res
+        .status(404)
+        .json({ ok: false, message: "Usuario no encontrado." });
+    }
+
+    return res.json({ ok: true, item: updated });
+  } catch (err) {
+    console.error("setCollectorCommissionPenaltyPerDay error:", err);
+    return res.status(500).json({
+      ok: false,
+      message: "Error actualizando la penalización diaria del cobrador.",
+    });
   }
 };

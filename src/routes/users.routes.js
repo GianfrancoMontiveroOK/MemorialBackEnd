@@ -9,6 +9,9 @@ import {
   setUserRole,
   setUserCobrador,
   setUserVendedor,
+  setCollectorCommission,
+  setCollectorCommissionGraceDays,
+  setCollectorCommissionPenaltyPerDay,
 } from "../controllers/users.controller.js";
 import {
   requireSession,
@@ -80,4 +83,20 @@ router.patch(
   setUserVendedor
 );
 
+// ⬇️ nuevos
+router.patch(
+  "/users/:id/collector-commission",
+  requireSession,
+  setCollectorCommission
+);
+router.patch(
+  "/users/:id/collector-commission-grace-days",
+  requireSession,
+  setCollectorCommissionGraceDays
+);
+router.patch(
+  "/users/:id/collector-commission-penalty",
+  requireSession,
+  setCollectorCommissionPenaltyPerDay
+);
 export default router;

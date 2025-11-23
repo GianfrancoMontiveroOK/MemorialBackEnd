@@ -23,7 +23,10 @@ const userSchema = new mongoose.Schema(
     // En user.model.js, dentro del schema:
     idCobrador: { type: String, index: true }, // o ObjectId si referencia otra colección
     idVendedor: { type: String, index: true },
-
+    // 🔹 Porcentaje de comisión del cobrador (0–100)
+    porcentajeCobrador: { type: Number, min: 0, max: 100 },
+    commissionGraceDays: { type: Number, min: 0 },
+    commissionPenaltyPerDay: { type: Number, min: 0 },
     // Roles: buyer (default), organizer, staff, admin
     role: {
       type: String,
