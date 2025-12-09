@@ -1,4 +1,4 @@
-// src/controllers/collector.payments.controller.js
+// src/controllers/admin.payments.controller.js
 import mongoose from "mongoose";
 import crypto from "crypto";
 
@@ -6,6 +6,7 @@ import Cliente from "../models/client.model.js";
 import Payment from "../models/payment.model.js";
 import LedgerEntry from "../models/ledger-entry.model.js";
 import Receipt from "../models/receipt.model.js";
+import User from "../models/user.model.js";
 
 import { generateReceipt } from "../services/receipt.service.js";
 import { enqueue } from "../services/outbox.service.js";
@@ -20,24 +21,60 @@ import {
   comparePeriod,
   fifoAllocateUntilNow,
   serializePayment,
-  // 🆕 nuevas utils de períodos / atrasos
-  countArrearsMonths,
 } from "./payments.shared.js";
 
-export async function createCollectorPayment(req, res, next) {
+const { Types } = mongoose;
+
+/**
+ * Cobro desde OFICINA (admin / superAdmin)
+ *
+ * POST /admin/pagos
+ *
+ * Diferencias vs cobrador:
+ *  - No valida cartera del cobrador (oficina puede cobrar a cualquiera).
+ *  - Usa idCobrador simbólico ADMIN_COLLECTOR_ID (ej. 0).
+ *  - Asiento:
+ *      DEBIT  CAJA_ADMIN / CAJA_SUPERADMIN (según rol)
+ *      CREDIT INGRESOS_CUOTAS
+ */
+
+const ADMIN_COLLECTOR_ID = 0; // idCobrador simbólico para caja de oficina
+
+/* ============ POST /admin/pagos ============ */
+export async function createAdminPayment(req, res, next) {
   const session = await mongoose.startSession();
   session.startTransaction();
   try {
-    const myCollectorId = Number(req.user?.idCobrador);
     const myUserId = req.user?._id || req.user?.id;
-
-    if (!Number.isFinite(myCollectorId) || !myUserId) {
+    if (!myUserId) {
       await session.abortTransaction();
-      return res.status(400).json({
+      return res
+        .status(400)
+        .json({ ok: false, message: "Sesión inválida: falta userId." });
+    }
+
+    // Sólo admin / superAdmin pueden cobrar por caja de oficina
+    const myUser = await User.findById(myUserId)
+      .select("role")
+      .session(session)
+      .lean();
+
+    if (!myUser) {
+      await session.abortTransaction();
+      return res
+        .status(400)
+        .json({ ok: false, message: "Usuario no encontrado." });
+    }
+
+    if (!["admin", "superAdmin"].includes(myUser.role)) {
+      await session.abortTransaction();
+      return res.status(403).json({
         ok: false,
-        message: "Sesión inválida: falta idCobrador o userId.",
+        message: "No tiene permiso para cobrar por caja de oficina.",
       });
     }
+
+    const userRole = myUser.role; // "admin" | "superAdmin"
 
     const {
       clienteId,
@@ -46,7 +83,7 @@ export async function createCollectorPayment(req, res, next) {
       method,
       notes,
       idempotencyKey,
-      channel = "field",
+      channel = "backoffice", // por defecto, cobro de oficina
       intendedPeriod,
       externalRef,
       geo,
@@ -63,7 +100,7 @@ export async function createCollectorPayment(req, res, next) {
       return res.status(400).json({ ok: false, message: "clienteId inválido" });
     }
 
-    // 1) Validar cliente y scope
+    // 1) Buscar cliente (SIN validar cartera)
     const member = await Cliente.findById(clienteId)
       .select(
         "_id idCliente nombre nombreTitular idCobrador usarCuotaIdeal cuota cuotaIdeal"
@@ -77,12 +114,7 @@ export async function createCollectorPayment(req, res, next) {
         .status(404)
         .json({ ok: false, message: "Cliente no encontrado" });
     }
-    if (Number(member.idCobrador) !== myCollectorId) {
-      await session.abortTransaction();
-      return res
-        .status(403)
-        .json({ ok: false, message: "El cliente no pertenece a tu cartera." });
-    }
+
     if (
       legacyIdCliente != null &&
       Number(legacyIdCliente) !== Number(member.idCliente)
@@ -94,7 +126,7 @@ export async function createCollectorPayment(req, res, next) {
       });
     }
 
-    // 2) Estado de deuda hasta periodo actual
+    // 2) Estado de deuda hasta período actual (igual que cobrador)
     const nowPeriod = yyyymmAR(new Date());
     let debtState = await getClientPeriodState(member, {
       to: nowPeriod,
@@ -115,56 +147,23 @@ export async function createCollectorPayment(req, res, next) {
       });
     }
 
-    // 🆕 2.1) Meses de atraso (solo lectura para reglas de negocio)
-    const arrearsMonths = countArrearsMonths(debtState, nowPeriod);
-
-    // 🆕 Regla de corte: 4+ meses de atraso → no se permite cobrar por cobrador
-    if (arrearsMonths >= 4) {
-      await session.abortTransaction();
-      return res.status(409).json({
-        ok: false,
-        code: "ARREARS_CUTOFF_4M",
-        message:
-          "El grupo familiar supera el límite de 4 meses de atraso. Contactar administración.",
-        nowPeriod,
-        arrearsMonths,
-      });
-    }
-
-    // 3) Monto final
-    const cuotaVigente =
+    // 3) Monto final (usa cuota vigente si no mandan amount)
+    const computedAmount =
       Number(member.usarCuotaIdeal ? member.cuotaIdeal : member.cuota) || 0;
-
-    // 🆕 Lógica corregida:
-    // - Si viene amount explícito -> se respeta.
-    // - Si NO viene amount y la estrategia es AUTO (FIFO) -> usar toda la deuda hasta ahora.
-    // - Si NO viene amount y es MANUAL -> por defecto una cuota (luego se ajusta si breakdown suma distinto).
-    const hasExplicitAmount = Number(amount) > 0;
-    const isAuto = String(strategy).toLowerCase() === "auto";
-
-    let finalAmount;
-    if (hasExplicitAmount) {
-      finalAmount = Number(amount);
-    } else if (isAuto) {
-      // ⬅️ FIFO sin amount: cobrá TODO lo vencido hasta el período actual
-      finalAmount = totalDueUpToNow;
-    } else {
-      // manual sin amount -> por defecto una cuota (se puede ajustar luego con breakdown)
-      finalAmount = cuotaVigente;
-    }
+    const finalAmount = Number(amount) > 0 ? Number(amount) : computedAmount;
 
     if (!(finalAmount > 0)) {
       await session.abortTransaction();
       return res
         .status(400)
-        .json({ ok: false, message: "No hay monto válido para cobrar (> 0)." });
+        .json({ ok: false, message: "No hay cuota vigente definida (> 0)." });
     }
 
     // 4) Método + idempotencia
     const finalMethod = (method || "efectivo").toString().trim().toLowerCase();
     const finalIdem =
       (idempotencyKey && String(idempotencyKey).trim()) ||
-      `pay_${member._id}_${Date.now()}_${crypto
+      `pay_office_${member._id}_${Date.now()}_${crypto
         .randomBytes(4)
         .toString("hex")}`;
 
@@ -180,7 +179,7 @@ export async function createCollectorPayment(req, res, next) {
         .json({ ok: true, data: serializePayment(existing, rx) });
     }
 
-    // 5) Construcción de imputaciones
+    // 5) Construcción de imputaciones (igual filosofía que cobrador)
     let allocations = [];
     let periodsApplied = [];
 
@@ -191,7 +190,9 @@ export async function createCollectorPayment(req, res, next) {
       ])
     );
 
-    if (String(strategy).toLowerCase() === "manual") {
+    const STRAT = String(strategy || "auto").toLowerCase();
+
+    if (STRAT === "manual") {
       let sum = 0;
       for (const row of breakdown) {
         const period = String(row?.period || "");
@@ -228,11 +229,6 @@ export async function createCollectorPayment(req, res, next) {
         });
       }
 
-      // 🆕 Si NO vino amount explícito, ajustamos el monto del pago a la suma del breakdown
-      if (!hasExplicitAmount && sum > 0) {
-        finalAmount = sum;
-      }
-
       if (sum > finalAmount) {
         await session.abortTransaction();
         return res.status(409).json({
@@ -261,7 +257,6 @@ export async function createCollectorPayment(req, res, next) {
       }
       periodsApplied = Array.from(new Set(allocations.map((a) => a.period)));
     } else {
-      // AUTO (FIFO) — ahora usando finalAmount que ya puede ser totalDueUpToNow
       const { allocations: fifo } = fifoAllocateUntilNow(
         debtState,
         nowPeriod,
@@ -289,7 +284,7 @@ export async function createCollectorPayment(req, res, next) {
       periodsApplied = allocations.map((a) => a.period);
     }
 
-    // 6) Re-chequeo anti-carrera con estado fresco dentro de la misma TX
+    // 6) Re-chequeo anti-carrera con estado fresco dentro de la TX
     debtState = await getClientPeriodState(member, {
       to: nowPeriod,
       includeFuture: 0,
@@ -302,18 +297,15 @@ export async function createCollectorPayment(req, res, next) {
     );
     for (const a of allocations) {
       const bal = freshBal.get(a.period) ?? 0;
-      if (a.amountApplied > bal + 0.0001) {
+      if (a.amount > bal + 0.0001) {
         await session.abortTransaction();
         return res.status(409).json({
           ok: false,
           code: "RACE_CONDITION_OVERPAY",
-          message: `El período ${a.period} cambió y ya no admite ${a.amountApplied} (saldo: ${bal}). Refrescá y reintentá.`,
+          message: `El período ${a.period} cambió y ya no admite ${a.amount} (saldo: ${bal}). Refrescá y reintentá.`,
         });
       } else {
-        freshBal.set(
-          a.period,
-          Math.max(0, bal - a.amountApplied) // reserva lógica
-        );
+        freshBal.set(a.period, Math.max(0, bal - a.amount));
       }
     }
 
@@ -328,7 +320,10 @@ export async function createCollectorPayment(req, res, next) {
             nombre: member.nombre,
             nombreTitular: member.nombreTitular || null,
           },
-          collector: { idCobrador: myCollectorId, userId: myUserId },
+          collector: {
+            idCobrador: ADMIN_COLLECTOR_ID,
+            userId: myUserId,
+          },
           currency: "ARS",
           amount: finalAmount,
           method: finalMethod,
@@ -343,10 +338,7 @@ export async function createCollectorPayment(req, res, next) {
           ip: ip || undefined,
           createdBy: myUserId,
           allocations,
-          meta: {
-            periodsApplied,
-            arrearsMonthsAtPayment: arrearsMonths,
-          },
+          meta: { periodsApplied },
         },
       ],
       { session }
@@ -357,21 +349,37 @@ export async function createCollectorPayment(req, res, next) {
     if (collectedAt) p.postedAt = new Date(collectedAt);
     await p.save({ session });
 
-    // 8) Ledger (doble partida por total)
     const postedAt = p.postedAt || new Date();
+
+    // 8) Ledger (doble partida) — CAJA_ADMIN / CAJA_SUPERADMIN vs INGRESOS_CUOTAS
+    const cashAccountCode =
+      userRole === "superAdmin"
+        ? ACCOUNTS.CAJA_SUPERADMIN
+        : ACCOUNTS.CAJA_ADMIN;
+
+    if (!cashAccountCode) {
+      throw new Error(
+        "Configuración de cuentas contables inválida: falta CAJA_ADMIN/CAJA_SUPERADMIN en ACCOUNTS."
+      );
+    }
+    if (!ACCOUNTS.INGRESOS_CUOTAS) {
+      throw new Error(
+        "Configuración de cuentas contables inválida: falta INGRESOS_CUOTAS en ACCOUNTS."
+      );
+    }
+
     await LedgerEntry.insertMany(
       [
         {
           paymentId: p._id,
           userId: myUserId,
           side: "debit",
-          accountCode: ACCOUNTS.CAJA_COBRADOR,
+          accountCode: cashAccountCode,
           amount: Math.abs(p.amount),
           currency: p.currency,
           postedAt,
           dimensions: {
-            userId: new mongoose.Types.ObjectId(String(myUserId)),
-            idCobrador: p.collector.idCobrador,
+            idCobrador: ADMIN_COLLECTOR_ID,
             idCliente: p.cliente.idCliente,
             canal: p.channel,
           },
@@ -385,8 +393,7 @@ export async function createCollectorPayment(req, res, next) {
           currency: p.currency,
           postedAt,
           dimensions: {
-            userId: new mongoose.Types.ObjectId(String(myUserId)),
-            idCobrador: p.collector.idCobrador,
+            idCobrador: ADMIN_COLLECTOR_ID,
             idCliente: p.cliente.idCliente,
             canal: p.channel,
           },
@@ -458,7 +465,6 @@ export async function createCollectorPayment(req, res, next) {
         userId: String(p.collector.userId),
         externalRef: p.externalRef || null,
         periodsApplied: p.meta?.periodsApplied || [],
-        arrearsMonthsAtPayment: p.meta?.arrearsMonthsAtPayment ?? null,
       },
       { session }
     );
@@ -472,6 +478,7 @@ export async function createCollectorPayment(req, res, next) {
     try {
       await session.abortTransaction();
     } catch {}
+
     // Idempotencia por índice único
     if (err?.code === 11000 && err?.keyPattern?.idempotencyKey) {
       try {
@@ -488,20 +495,38 @@ export async function createCollectorPayment(req, res, next) {
         }
       } catch {}
     }
+
     return next(err);
   } finally {
     session.endSession();
   }
 }
 
-/* ============ GET /collector/pagos ============ */
-export async function listCollectorPayments(req, res, next) {
+/**
+ * Listado de pagos de oficina (admin / superAdmin)
+ *
+ * GET /admin/pagos
+ *
+ * Similar a listCollectorPayments, pero:
+ *  - No limita por "collector.idCobrador" del usuario.
+ *  - Devuelve sólo pagos de canal "backoffice" (caja de oficina) y kind "payment".
+ *  - Permite filtrar opcionalmente por clientId, collectorId, fechas, etc.
+ */
+export async function listAdminPayments(req, res, next) {
   try {
-    const myCollectorId = Number(req.user?.idCobrador);
-    if (!Number.isFinite(myCollectorId)) {
+    const myUserId = req.user?._id || req.user?.id;
+    if (!myUserId) {
       return res
         .status(400)
-        .json({ ok: false, message: "Falta idCobrador en la sesión." });
+        .json({ ok: false, message: "Sesión inválida: falta userId." });
+    }
+
+    const myUser = await User.findById(myUserId).select("role").lean();
+    if (!myUser || !["admin", "superAdmin"].includes(myUser.role)) {
+      return res.status(403).json({
+        ok: false,
+        message: "No tiene permiso para ver pagos de oficina.",
+      });
     }
 
     const page = Math.max(toInt(req.query.page, 1), 1);
@@ -514,16 +539,28 @@ export async function listCollectorPayments(req, res, next) {
     const status = String(req.query.status || "").trim();
     const sortByParam = (req.query.sortBy || "postedAt").toString();
     const sortDirParam = toDir(req.query.sortDir || "desc");
+    const collectorIdParam = String(req.query.collectorId || "").trim();
 
-    const and = [{ "collector.idCobrador": myCollectorId }];
+    // Base: sólo pagos de tipo "payment" y canal "backoffice"
+    const and = [{ kind: "payment" }, { channel: "backoffice" }];
 
-    if (clientId && isObjectId(clientId)) {
-      and.push({ "cliente.memberId": new mongoose.Types.ObjectId(clientId) });
+    // Opcional: filtrar por cobrador (idCobrador) si se manda collectorId
+    if (collectorIdParam) {
+      const n = Number(collectorIdParam);
+      if (Number.isFinite(n)) {
+        and.push({ "collector.idCobrador": n });
+      }
     }
+
+    // Filtrar por cliente (memberId)
+    if (clientId && isObjectId(clientId)) {
+      and.push({ "cliente.memberId": new Types.ObjectId(clientId) });
+    }
+
     if (method) and.push({ method });
     if (status) and.push({ status });
 
-    // rango por postedAt (fallback createdAt)
+    // Rango por postedAt (fallback createdAt)
     const parseISO = (s) => {
       const dt = new Date(`${s}T00:00:00`);
       return Number.isNaN(dt.getTime()) ? null : dt;
@@ -551,8 +588,10 @@ export async function listCollectorPayments(req, res, next) {
       });
     }
 
+    // Búsqueda simple (nombre, idCliente, externalRef, número de recibo)
     if (qRaw) {
       const isNum = /^\d+$/.test(qRaw);
+
       const receipts = await Receipt.find(
         isNum
           ? { number: qRaw }
@@ -566,6 +605,7 @@ export async function listCollectorPayments(req, res, next) {
         .select("paymentId")
         .limit(200)
         .lean();
+
       const rxIds = (receipts || []).map((r) => r.paymentId);
 
       const or = [
@@ -589,6 +629,7 @@ export async function listCollectorPayments(req, res, next) {
       "status",
     ]);
     const sortBy = SORTABLE.has(sortByParam) ? sortByParam : "postedAt";
+
     const sortStage =
       sortBy === "postedAt"
         ? { $sort: { postedAt: sortDirParam, _id: sortDirParam } }
@@ -612,8 +653,6 @@ export async function listCollectorPayments(req, res, next) {
       cliente: 1,
       collector: 1,
       "meta.periodsApplied": 1,
-      // meta.arrearsMonthsAtPayment queda disponible en queries puntuales,
-      // pero no lo proyectamos acá para no cambiar el shape del response.
     };
 
     const [items, count] = await Promise.all([
@@ -639,6 +678,7 @@ export async function listCollectorPayments(req, res, next) {
 
     return res.json({
       ok: true,
+      okList: true,
       items: out,
       total: count,
       page,
@@ -647,6 +687,6 @@ export async function listCollectorPayments(req, res, next) {
       sortDir: sortDirParam === 1 ? "asc" : "desc",
     });
   } catch (err) {
-    next(err);
+    return next(err);
   }
 }

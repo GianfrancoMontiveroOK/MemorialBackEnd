@@ -56,6 +56,55 @@ const asObjectId = (s) => {
     return null;
   }
 };
+const monthNamesEs = [
+  "enero",
+  "febrero",
+  "marzo",
+  "abril",
+  "mayo",
+  "junio",
+  "julio",
+  "agosto",
+  "septiembre",
+  "octubre",
+  "noviembre",
+  "diciembre",
+];
+
+const normalizeDateStart = (v) => {
+  if (!v) return null;
+  const d = new Date(v);
+  if (Number.isNaN(d.getTime())) return null;
+  d.setHours(0, 0, 0, 0);
+  return d;
+};
+
+const normalizeDateEnd = (v) => {
+  if (!v) return null;
+  const d = new Date(v);
+  if (Number.isNaN(d.getTime())) return null;
+  d.setHours(23, 59, 59, 999);
+  return d;
+};
+
+const diffInDays = (from, to) => {
+  const a = new Date(from);
+  const b = new Date(to);
+  if (Number.isNaN(a.getTime()) || Number.isNaN(b.getTime())) return 0;
+  const ms = b.getTime() - a.getTime();
+  return Math.max(0, Math.floor(ms / (1000 * 60 * 60 * 24)));
+};
+// Helper local para validar si algo "parece" un ObjectId
+const isObjectIdLike = (v) => {
+  if (!v) return false;
+  try {
+    // fuerza a string por las dudas
+    new mongoose.Types.ObjectId(String(v));
+    return true;
+  } catch {
+    return false;
+  }
+};
 
 // 🔧 Match unificado por usuario y cuentas
 // - admin / superAdmin: match estricto por userId
@@ -704,6 +753,8 @@ export async function getArqueoUsuarioDetalle(req, res, next) {
     const sortByParam = String(req.query.sortBy || "postedAt");
     const sortDirParam = toDir(req.query.sortDir || "desc");
 
+    const rawUserId = String(req.query.userId || "").trim();
+
     const accountCodesOverride = String(req.query.accountCodes || "")
       .split(",")
       .map((s) => s.trim())
@@ -715,10 +766,145 @@ export async function getArqueoUsuarioDetalle(req, res, next) {
     const toDt = parseISODate(req.query.dateTo, true);
     const side = String(req.query.side || "");
 
-    // Resolver usuario
+    const SORTABLE = new Set([
+      "postedAt",
+      "amount",
+      "accountCode",
+      "side",
+      "currency",
+    ]);
+    const sortBy = SORTABLE.has(sortByParam) ? sortByParam : "postedAt";
+    const sortStage = { $sort: { [sortBy]: sortDirParam, _id: sortDirParam } };
+
+    /* ────────────────────── RAMA: CAJAS GLOBALES ──────────────────────
+       IDs como: "GLOBAL:CAJA_GRANDE", "GLOBAL:BANCO_NACION", etc.
+       No hay usuario real, filtramos directamente por accountCode.
+    ------------------------------------------------------------------ */
+    const isGlobal = rawUserId.startsWith("GLOBAL:");
+
+    if (isGlobal) {
+      const globalCode = rawUserId.replace(/^GLOBAL:/, "").trim();
+
+      // Cuentas efectivas para la caja global:
+      // - Si viene override, se respetan.
+      // - Si no, se toma el código global de la fila.
+      const effectiveAccounts =
+        accountCodesOverride.length > 0 ? accountCodesOverride : [globalCode];
+
+      // Match básico por cuenta, fechas y side (si viene)
+      const match = {
+        accountCode: { $in: effectiveAccounts },
+      };
+
+      if (fromDt || toDt) {
+        match.postedAt = {
+          ...(fromDt ? { $gte: fromDt } : {}),
+          ...(toDt ? { $lte: toDt } : {}),
+        };
+      }
+
+      if (side === "debit" || side === "credit") {
+        match.side = side;
+      }
+
+      const base = [{ $match: match }];
+
+      const totalsPipeline = [
+        ...base,
+        {
+          $group: {
+            _id: null,
+            debits: debitExpr,
+            credits: creditExpr,
+            lastMovementAt: { $max: "$postedAt" },
+            paymentsSet: { $addToSet: "$paymentId" },
+          },
+        },
+        {
+          $project: {
+            _id: 0,
+            debits: 1,
+            credits: 1,
+            balance: { $subtract: ["$debits", "$credits"] },
+            lastMovementAt: 1,
+            paymentsCount: { $size: "$paymentsSet" },
+          },
+        },
+      ];
+
+      const itemsPipeline = [
+        ...base,
+        {
+          $project: {
+            _id: 1,
+            paymentId: 1,
+            side: 1,
+            accountCode: 1,
+            amount: 1,
+            currency: 1,
+            postedAt: 1,
+            dimensions: 1,
+            createdAt: 1,
+          },
+        },
+        sortStage,
+        { $skip: (page - 1) * limit },
+        { $limit: limit },
+      ];
+
+      const countPipeline = [...base, { $count: "n" }];
+
+      const [totalsArr, items, countRes] = await Promise.all([
+        LedgerEntry.aggregate(totalsPipeline).allowDiskUse(true),
+        LedgerEntry.aggregate(itemsPipeline).allowDiskUse(true),
+        LedgerEntry.aggregate(countPipeline).allowDiskUse(true),
+      ]);
+
+      const totals = totalsArr?.[0] || {
+        debits: 0,
+        credits: 0,
+        balance: 0,
+        lastMovementAt: null,
+        paymentsCount: 0,
+      };
+      const total = countRes?.[0]?.n || 0;
+
+      // "Usuario" virtual para header
+      const user = {
+        _id: rawUserId,
+        name: `${globalCode} (GLOBAL)`,
+        email: "",
+        role: "global",
+        idCobrador: null,
+      };
+
+      return res.json({
+        ok: true,
+        header: { user, idCobrador: null, totals },
+        items,
+        total,
+        page,
+        pageSize: limit,
+        sortBy,
+        sortDir: sortDirParam === 1 ? "asc" : "desc",
+        filters: {
+          accountCodes: effectiveAccounts,
+          dateFrom: req.query.dateFrom || null,
+          dateTo: req.query.dateTo || null,
+          side: side || null,
+          destAccountCode,
+          isGlobal: true,
+          globalCode,
+        },
+      });
+    }
+
+    /* ────────────────────── RAMA: USUARIOS REALES ────────────────────── */
+
+    // Resolver usuario real
     let user = null;
-    if (req.query.userId) {
-      user = await User.findById(req.query.userId)
+    if (rawUserId) {
+      user = await User.findById(rawUserId)
         .select("_id name email role idCobrador")
         .lean();
     } else if (req.query.idCobrador != null) {
@@ -730,6 +916,7 @@ export async function getArqueoUsuarioDetalle(req, res, next) {
           .select("_id name email role idCobrador")
           .lean());
     }
+
     if (!user)
       return res
         .status(400)
@@ -745,7 +932,7 @@ export async function getArqueoUsuarioDetalle(req, res, next) {
         : user.role === "admin"
         ? [destAccountCode] // CAJA_ADMIN (u otra dest)
         : user.role === "superAdmin"
-        ? SUPERADMIN_ACCOUNTS // ⬅️ CAJA_GRANDE + CAJA_SUPERADMIN
+        ? SUPERADMIN_ACCOUNTS // ⬅️ CAJA_GRANDE + CAJA_SUPERADMIN (personal del SA)
         : DEFAULT_ACCOUNTS; // cobrador
 
     const match = buildUserLedgerMatch({
@@ -780,16 +967,6 @@ export async function getArqueoUsuarioDetalle(req, res, next) {
         },
       },
     ];
-
-    const SORTABLE = new Set([
-      "postedAt",
-      "amount",
-      "accountCode",
-      "side",
-      "currency",
-    ]);
-    const sortBy = SORTABLE.has(sortByParam) ? sortByParam : "postedAt";
-    const sortStage = { $sort: { [sortBy]: sortDirParam, _id: sortDirParam } };
 
     const itemsPipeline = [
       ...base,
@@ -843,6 +1020,7 @@ export async function getArqueoUsuarioDetalle(req, res, next) {
         dateTo: req.query.dateTo || null,
         side: side || null,
         destAccountCode,
+        isGlobal: false,
       },
     });
   } catch (err) {
@@ -2014,5 +2192,431 @@ export async function getArqueoGlobalTotals(req, res, next) {
     });
   } catch (err) {
     next(err);
+  }
+}
+
+export async function getCollectorCommissionSummaryAdmin(req, res) {
+  try {
+    const {
+      userId, // _id Mongo del cobrador (User)
+      idCobrador, // opcional: idCobrador numérico
+      dateFrom, // opcional: YYYY-MM-DD
+      dateTo, // opcional: YYYY-MM-DD
+    } = req.query;
+
+    // ───────────────────────── Seguridad básica ─────────────────────────
+    const viewerRole = String(req.user?.role || "").trim();
+    if (!["admin", "superAdmin"].includes(viewerRole)) {
+      return res.status(403).json({
+        ok: false,
+        message: "Solo admin / superAdmin pueden ver resumen de comisiones.",
+      });
+    }
+
+    // Helper local para días entre fechas (A → B, en enteros)
+    const diffInDays = (from, to) => {
+      if (!from || !to) return 0;
+      const a = new Date(from);
+      const b = new Date(to);
+      if (Number.isNaN(a.getTime()) || Number.isNaN(b.getTime())) return 0;
+      const ms = b.getTime() - a.getTime();
+      return Math.max(0, Math.floor(ms / (1000 * 60 * 60 * 24)));
+    };
+
+    // ───────────────────────── Buscar cobrador ─────────────────────────
+    let collectorUser = null;
+
+    if (userId && isObjectIdLike(userId)) {
+      collectorUser = await User.findById(userId)
+        .select(
+          "name email role idCobrador porcentajeCobrador commissionGraceDays commissionPenaltyPerDay"
+        )
+        .lean();
+    } else if (idCobrador != null) {
+      const idCobStr = String(idCobrador);
+      collectorUser = await User.findOne({
+        role: "cobrador",
+        idCobrador: idCobStr,
+      })
+        .select(
+          "name email role idCobrador porcentajeCobrador commissionGraceDays commissionPenaltyPerDay"
+        )
+        .lean();
+    }
+
+    if (!collectorUser) {
+      return res.status(404).json({
+        ok: false,
+        message: "No se encontró el cobrador indicado.",
+      });
+    }
+
+    const myCollectorId = Number(collectorUser.idCobrador);
+    if (!Number.isFinite(myCollectorId) || myCollectorId <= 0) {
+      return res.status(400).json({
+        ok: false,
+        message: "El cobrador no tiene un idCobrador numérico válido.",
+      });
+    }
+
+    // ─────────────────────── Rango de fechas / período ───────────────────────
+    const now = new Date();
+
+    let rangeStart = normalizeDateStart(dateFrom);
+    let rangeEnd = normalizeDateEnd(dateTo);
+
+    // Si no mandan rango, usamos el mes actual
+    if (!rangeStart || !rangeEnd) {
+      const yearNow = now.getFullYear();
+      const monthNow = now.getMonth(); // 0–11
+      rangeStart = new Date(yearNow, monthNow, 1, 0, 0, 0, 0);
+      rangeEnd = new Date(yearNow, monthNow + 1, 0, 23, 59, 59, 999);
+    }
+
+    // El "period" lo tomamos del inicio del rango (YYYY-MM)
+    const period = yyyymmAR(rangeStart);
+    const year = rangeStart.getFullYear();
+    const month = rangeStart.getMonth();
+    const label = `${monthNamesEs[month] || "Mes"} ${year}`.replace(
+      /^\w/,
+      (c) => c.toUpperCase()
+    );
+
+    // Días del calendario del período (NO es crítico, pero ayuda en UI)
+    const daysInPeriod = new Date(year, month + 1, 0).getDate();
+    const daysElapsed =
+      now.getFullYear() === year && now.getMonth() === month
+        ? now.getDate()
+        : daysInPeriod;
+    const daysRemaining = Math.max(daysInPeriod - daysElapsed, 0);
+
+    // Días hábiles (lun–sáb)
+    const countWorkingDays = () => {
+      let total = 0;
+      let elapsed = 0;
+
+      for (let d = 1; d <= daysInPeriod; d++) {
+        const dt = new Date(year, month, d);
+        const day = dt.getDay(); // 0 = dom, 1 = lun, ..., 6 = sáb
+        const isWorking = day >= 1 && day <= 6; // lun–sáb
+
+        if (!isWorking) continue;
+        total++;
+
+        if (
+          now.getFullYear() === year &&
+          now.getMonth() === month &&
+          d <= now.getDate()
+        ) {
+          elapsed++;
+        } else if (now.getFullYear() > year || now.getMonth() > month) {
+          // período ya pasó por completo
+          elapsed = total;
+        }
+      }
+      const remaining = Math.max(total - elapsed, 0);
+      return { total, elapsed, remaining };
+    };
+
+    const {
+      total: workingDaysTotal,
+      elapsed: workingDaysElapsed,
+      remaining: workingDaysRemaining,
+    } = countWorkingDays();
+
+    // ───────────────────── Config de comisión (User) ─────────────────────
+    let baseCommissionRate = 0; // decimal (0.05 = 5 %)
+    let graceDays = 7;
+    let penaltyPerDay = 0;
+
+    const rawPercent = collectorUser.porcentajeCobrador;
+    if (typeof rawPercent === "number" && rawPercent > 0) {
+      // Soporta 5 o 0.05
+      baseCommissionRate = rawPercent <= 1 ? rawPercent : rawPercent / 100;
+    }
+
+    if (
+      collectorUser &&
+      collectorUser.commissionGraceDays != null &&
+      Number.isFinite(Number(collectorUser.commissionGraceDays))
+    ) {
+      graceDays = Number(collectorUser.commissionGraceDays);
+    }
+
+    const rawPenalty = collectorUser.commissionPenaltyPerDay;
+    if (typeof rawPenalty === "number" && rawPenalty > 0) {
+      // Soporta 0.1 = 10% de la TASA por día, o 10 = 10% también
+      penaltyPerDay = rawPenalty <= 1 ? rawPenalty : rawPenalty / 100;
+    }
+
+    // ───────────────── Clientes asignados + cuota vigente ─────────────────
+    const clientsAgg = await Cliente.aggregate([
+      { $match: { idCobrador: myCollectorId } },
+
+      {
+        $addFields: {
+          createdAtSafe: { $ifNull: ["$createdAt", { $toDate: "$_id" }] },
+          _rankTitular: { $cond: [{ $eq: ["$rol", "TITULAR"] }, 0, 1] },
+          _rankIntegrante: {
+            $cond: [
+              {
+                $and: [
+                  { $isNumber: "$integrante" },
+                  { $gte: ["$integrante", 0] },
+                ],
+              },
+              "$integrante",
+              9999,
+            ],
+          },
+          _cuotaVigente: {
+            $cond: [
+              { $eq: [{ $ifNull: ["$usarCuotaIdeal", false] }, true] },
+              { $ifNull: ["$cuotaIdeal", 0] },
+              { $ifNull: ["$cuota", 0] },
+            ],
+          },
+          __isActive: {
+            $and: [
+              { $ne: [{ $type: "$baja" }, "date"] },
+              {
+                $or: [
+                  { $eq: ["$activo", true] },
+                  { $not: [{ $eq: ["$activo", false] }] },
+                ],
+              },
+            ],
+          },
+        },
+      },
+
+      {
+        $sort: {
+          idCliente: 1,
+          _rankTitular: 1,
+          _rankIntegrante: 1,
+          createdAtSafe: 1,
+          _id: 1,
+        },
+      },
+
+      {
+        $group: {
+          _id: "$idCliente",
+          firstDoc: { $first: "$$ROOT" },
+          cuotaVigente: { $first: "$_cuotaVigente" },
+          isActive: { $max: "$__isActive" },
+        },
+      },
+
+      { $match: { isActive: true } },
+
+      {
+        $group: {
+          _id: null,
+          assignedClients: { $sum: 1 },
+          totalChargeNow: { $sum: "$cuotaVigente" },
+        },
+      },
+    ]).allowDiskUse(true);
+
+    const assignedClients = clientsAgg?.[0]?.assignedClients || 0;
+    const totalChargeNow = clientsAgg?.[0]?.totalChargeNow || 0;
+
+    // ───────────────── Pagos del período + comisión pago a pago ─────────────────
+    const paymentsAgg = await Payment.aggregate([
+      {
+        $match: {
+          "collector.idCobrador": myCollectorId,
+          status: { $in: ["posted", "settled"] },
+          $expr: {
+            $and: [
+              {
+                $gte: [{ $ifNull: ["$postedAt", "$createdAt"] }, rangeStart],
+              },
+              { $lte: [{ $ifNull: ["$postedAt", "$createdAt"] }, rangeEnd] },
+            ],
+          },
+        },
+      },
+      { $unwind: "$allocations" },
+      {
+        $match: {
+          "allocations.period": period, // solo lo imputado a este período
+        },
+      },
+      {
+        $project: {
+          _id: 1,
+          // Fecha BASE para calcular la antigüedad del pago:
+          // usamos createdAt explícitamente (lo que vos pediste),
+          // y dejamos postedAt por si en algún momento lo necesitás en UI.
+          paymentDate: "$createdAt",
+          postedAt: { $ifNull: ["$postedAt", "$createdAt"] },
+          amountApplied: "$allocations.amountApplied",
+          "cliente.idCliente": 1,
+        },
+      },
+    ]).allowDiskUse(true);
+
+    const clientsSet = new Set();
+    let totalCollectedThisPeriod = 0;
+    let totalCommissionIdeal = 0; // sin penalidad
+    let totalCommissionDiscounted = 0; // con penalidad pago a pago
+
+    for (const p of paymentsAgg) {
+      const clientId = p.cliente?.idCliente;
+      if (clientId != null) clientsSet.add(clientId);
+
+      const applied = Number(p.amountApplied) || 0;
+      totalCollectedThisPeriod += applied;
+
+      const idealRate = baseCommissionRate;
+      const idealCommission = applied * idealRate;
+      totalCommissionIdeal += idealCommission;
+
+      // ── Cálculo del % efectivo para ESTE pago ──
+      let effectiveRate = idealRate;
+
+      if (idealRate > 0 && penaltyPerDay > 0) {
+        const baseDate = p.paymentDate || p.postedAt || null; // createdAt como prioridad
+        if (baseDate) {
+          const daysHeld = diffInDays(baseDate, now);
+
+          if (daysHeld > graceDays) {
+            const extraDays = daysHeld - graceDays;
+
+            // penaltyPerDay = % de la TASA por día
+            // ej: tasa 5% (0.05), penaltyPerDay 0.1 = 10% de la tasa/día:
+            //   día 1 después de gracia → factor = 1 - 0.1 = 0.9 → 4.5%
+            //   día 2 después de gracia → factor = 1 - 0.2 = 0.8 → 4.0%
+            const reductionFactor = penaltyPerDay * extraDays;
+            const effectiveFactor = Math.max(0, 1 - reductionFactor);
+
+            effectiveRate = idealRate * effectiveFactor;
+          }
+        }
+      }
+
+      const discountedCommission = applied * effectiveRate;
+      totalCommissionDiscounted += discountedCommission;
+    }
+
+    const clientsWithPayment = clientsSet.size;
+    const clientsWithoutPayment = Math.max(
+      assignedClients - clientsWithPayment,
+      0
+    );
+
+    // ───────────────── Saldo actual en mano del cobrador (caja) ─────────────────
+    const cashAccounts = ["CAJA_COBRADOR", "A_RENDIR_COBRADOR"];
+
+    const balanceAgg = await LedgerEntry.aggregate([
+      {
+        $match: {
+          "dimensions.idCobrador": myCollectorId,
+          accountCode: { $in: cashAccounts },
+        },
+      },
+      {
+        $group: {
+          _id: null,
+          debits: {
+            $sum: {
+              $cond: [{ $eq: ["$side", "debit"] }, "$amount", 0],
+            },
+          },
+          credits: {
+            $sum: {
+              $cond: [{ $eq: ["$side", "credit"] }, "$amount", 0],
+            },
+          },
+        },
+      },
+    ]).allowDiskUse(true);
+
+    const debits = balanceAgg?.[0]?.debits || 0;
+    const credits = balanceAgg?.[0]?.credits || 0;
+    const collectorBalance = debits - credits;
+
+    // ───────────────── Comisiones globales ─────────────────
+    const expectedCommission = totalChargeNow * baseCommissionRate; // si cobrara toda la cartera al % completo
+    const currentCommission = totalCommissionDiscounted; // con penalidad pago por pago
+
+    // ───────────────── Lo ya pagado como comisión (ledger) ─────────────────
+    const paidAgg = await LedgerEntry.aggregate([
+      {
+        $match: {
+          kind: "commission_payout",
+          "dimensions.idCobrador": myCollectorId,
+          $expr: {
+            $and: [
+              { $gte: ["$postedAt", rangeStart] },
+              { $lte: ["$postedAt", rangeEnd] },
+            ],
+          },
+        },
+      },
+      {
+        $group: {
+          _id: null,
+          totalPaid: { $sum: "$amount" },
+        },
+      },
+    ]).allowDiskUse(true);
+
+    const alreadyPaid = paidAgg?.[0]?.totalPaid || 0;
+    const pendingCommission = Math.max(currentCommission - alreadyPaid, 0);
+
+    // ───────────────── Respuesta ─────────────────
+    return res.json({
+      ok: true,
+      data: {
+        collector: {
+          userId: collectorUser._id,
+          name: collectorUser.name || null,
+          email: collectorUser.email || null,
+          idCobrador: myCollectorId,
+        },
+        month: {
+          period, // "YYYY-MM"
+          label,
+          daysInPeriod,
+          daysElapsed,
+          daysRemaining,
+          workingDaysTotal,
+          workingDaysElapsed,
+          workingDaysRemaining,
+          totalChargeNow,
+          totalCollectedThisPeriod,
+          clientsWithPayment,
+          clientsWithoutPayment,
+        },
+        balance: {
+          collectorBalance,
+        },
+        commissions: {
+          config: {
+            basePercent: baseCommissionRate, // decimal (0.05 = 5%)
+            graceDays,
+            penaltyPerDay, // % de la TASA por día
+          },
+          amounts: {
+            expectedCommission, // si cobrara toda la cartera en término
+            totalCommission: currentCommission, // “debería cobrar” HOY, con castigo por demora
+            totalCommissionNoPenalty: totalCommissionIdeal, // referencia sin castigo
+            alreadyPaid, // ya pagado en este rango (kind=commission_payout)
+            pendingCommission, // lo lógico a pagar ahora
+          },
+        },
+      },
+    });
+  } catch (err) {
+    console.error("getCollectorCommissionSummaryAdmin error:", err);
+    return res.status(500).json({
+      ok: false,
+      message: "Error al calcular la comisión del cobrador.",
+      error: err?.message,
+    });
   }
 }

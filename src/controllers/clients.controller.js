@@ -6,6 +6,9 @@ import { recomputeGroupPricing } from "../services/pricing.services.js";
 import Payment from "../models/payment.model.js";
 import LedgerEntry from "../models/ledger-entry.model.js";
 import User from "../models/user.model.js";
+import { yyyymmAR, comparePeriod } from "./payments.shared.js";
+import { getClientPeriodState } from "../services/debt.service.js";
+
 /* ===================== Helpers de parseo ===================== */
 
 const isObjectId = (v) => mongoose.Types.ObjectId.isValid(String(v || ""));
@@ -273,23 +276,17 @@ export async function getClienteById(req, res, next) {
     return m?.activo !== false;
   };
 
-  // Campos sensibles que removemos para el rol "cobrador"
-  const SENSITIVE_KEYS = new Set([
-    "domicilio",
-    "ciudad",
-    "provincia",
-    "cp",
-    "telefono",
-    "documento",
-    "docTipo",
-    "cuil",
-    "fechaNac",
-    "observaciones",
-    "tipoFactura",
-    "factura",
-    "tarjeta",
-    "emergencia",
-  ]);
+  const PERIOD_RE = /^\d{4}-(0[1-9]|1[0-2])$/;
+  const normalizePeriod = (s) => {
+    const str = String(s || "").trim();
+    return PERIOD_RE.test(str) ? str : null;
+  };
+  const localComparePeriod = (a, b) => {
+    const A = normalizePeriod(a);
+    const B = normalizePeriod(b);
+    if (!A || !B) return 0;
+    return A === B ? 0 : A < B ? -1 : 1;
+  };
 
   // Deja pasar únicamente un subconjunto (sin sensibles) para cobrador
   const allowForCollector = (o) => {
@@ -305,10 +302,11 @@ export async function getClienteById(req, res, next) {
       edad: o.edad,
       activo: o.activo,
       baja: o.baja,
-      // pricing (sin cuotaVigente)
+      // pricing (agregamos cuotaVigente)
       cuota: o.cuota,
       cuotaIdeal: o.cuotaIdeal,
       usarCuotaIdeal: o.usarCuotaIdeal,
+      cuotaVigente: o.cuotaVigente,
       // flags de producto
       cremacion: o.cremacion,
       parcela: o.parcela,
@@ -334,46 +332,75 @@ export async function getClienteById(req, res, next) {
   try {
     const id = String(req.params.id || "").trim();
     if (!isObjectId(id))
-      return res.status(400).json({ message: "ID inválido" });
+      return res.status(400).json({ ok: false, message: "ID inválido" });
 
     const docRaw = await Cliente.findById(id).lean();
     if (!docRaw)
-      return res.status(404).json({ message: "Cliente no encontrado" });
+      return res
+        .status(404)
+        .json({ ok: false, message: "Cliente no encontrado" });
 
     const redact = !!req.redactSensitive;
 
-    // data principal (con o sin redacción; sin cuotaVigente)
-    const data = redactIfNeeded(docRaw, redact);
-    const payload = { data };
+    // ==== cuotaVigente igual que en /collector/clientes/:id ====
+    const cuotaVigente = docRaw.usarCuotaIdeal
+      ? Number(docRaw.cuotaIdeal || 0)
+      : Number(docRaw.cuota || 0);
 
-    // expand=family | all
-    const expand = String(req.query.expand || "").toLowerCase();
+    const baseDoc = { ...docRaw, cuotaVigente };
+
+    // data principal (con o sin redacción)
+    const data = redactIfNeeded(baseDoc, redact);
+
+    // payload base: RESPUESTA CON EL MISMO SHAPE QUE EL COBRADOR
+    const payload = {
+      ok: true,
+      data,
+    };
+
+    // ---------- expand flags ----------
+    const expandRaw = String(req.query.expand || "").toLowerCase();
+    const expandTokens = expandRaw
+      .split(",")
+      .map((t) => t.trim())
+      .filter(Boolean);
+
     const shouldExpandFamily =
-      expand === "family" ||
-      expand === "all" ||
-      expand.split(",").includes("family");
+      expandTokens.includes("family") || expandTokens.includes("all");
 
+    const shouldExpandDebt =
+      expandTokens.includes("debt") || expandTokens.includes("all");
+
+    // ================= FAMILY (grupo) =================
     if (shouldExpandFamily) {
       const n = Number(docRaw.idCliente);
       if (Number.isFinite(n)) {
-        // Leemos TODO el grupo de ese idCliente
         const list = await Cliente.find({ idCliente: n })
           .select(
-            "_id idCliente nombre documento edad fechaNac activo cuota docTipo cuotaIdeal cremacion parcela rol integrante nombreTitular baja usarCuotaIdeal ingreso vigencia createdAt updatedAt sexo ciudad provincia cp telefono"
+            "_id idCliente nombre documento edad fechaNac activo cuota " +
+              "docTipo cuotaIdeal cremacion parcela rol integrante nombreTitular " +
+              "baja usarCuotaIdeal ingreso vigencia createdAt updatedAt sexo " +
+              "ciudad provincia cp telefono idCobrador"
           )
           .sort({ rol: 1, integrante: 1, nombre: 1, _id: 1 })
           .lean();
 
-        // family SIN el titular (para tablas/listas)
+        // mismo criterio que collector: excluir el propio miembro
         const familyRaw = list.filter(
           (m) => String(m._id) !== String(docRaw._id)
         );
 
-        // Activos robustos y SOLO póliza (TITULAR/INTEGRANTE)
+        // añadimos cuotaVigente a cada miembro (igual que en getCollectorClientById)
+        const familyWithCuota = familyRaw.map((m) => ({
+          ...m,
+          cuotaVigente: m.usarCuotaIdeal
+            ? Number(m.cuotaIdeal || 0)
+            : Number(m.cuota || 0),
+        }));
+
         const ALLOWED_ROL = new Set(["TITULAR", "INTEGRANTE"]);
 
-        // ⚠️ MUY IMPORTANTE: incluir al titular en el cómputo
-        const todos = [docRaw, ...familyRaw];
+        const todos = [baseDoc, ...familyWithCuota];
         const activosPoliza = todos
           .filter(isActiveRobust)
           .filter((m) => ALLOWED_ROL.has(m?.rol));
@@ -408,10 +435,12 @@ export async function getClienteById(req, res, next) {
           ? Math.max(...edades)
           : Number(docRaw.edad) || 0;
 
-        // 🔒 Aplicar redacción a family si corresponde
-        payload.family = redactFamilyIfNeeded(familyRaw, redact);
+        // family con el mismo shape (pero con soporte de redacción)
+        payload.family = redactFamilyIfNeeded(familyWithCuota, redact);
+
+        // info de grupo extra para admin
         payload.__groupInfo = {
-          integrantesCount: activosPoliza.length, // titular + integrantes activos
+          integrantesCount: activosPoliza.length,
           cremacionesCount,
           edadMax,
         };
@@ -423,6 +452,81 @@ export async function getClienteById(req, res, next) {
           edadMax: Number(docRaw.edad) || 0,
         };
       }
+    } else {
+      // por compatibilidad, siempre devolvemos family aunque sea []
+      if (!("family" in payload)) {
+        payload.family = [];
+      }
+    }
+
+    // ================= DEBT (vista admin, similar a /collector/clientes/:id/deuda) =================
+    if (shouldExpandDebt) {
+      try {
+        const { from, to, includeFuture } = req.query || {};
+
+        const base = await getClientPeriodState(baseDoc, {
+          from,
+          to,
+          includeFuture: Number(includeFuture),
+        });
+
+        let periods = Array.isArray(base?.periods) ? [...base.periods] : [];
+        const nowPeriod = yyyymmAR(new Date());
+
+        // ordenamos por período
+        periods.sort((a, b) => localComparePeriod(a.period, b.period));
+
+        const totalDueUpToNow = periods
+          .filter(
+            (p) =>
+              p?.period &&
+              localComparePeriod(p.period, nowPeriod) <= 0 &&
+              Number(p.balance ?? 0) > 0
+          )
+          .reduce((acc, p) => acc + Math.max(0, Number(p.balance || 0)), 0);
+
+        const monthsDue = periods.filter(
+          (p) =>
+            p?.period &&
+            localComparePeriod(p.period, nowPeriod) <= 0 &&
+            Number(p.balance ?? 0) > 0
+        ).length;
+
+        let lastDuePeriod = null;
+        for (const p of periods) {
+          const per = p.period;
+          const bal = Number(p.balance || 0);
+          if (!per || bal <= 0) continue;
+          if (localComparePeriod(per, nowPeriod) <= 0) {
+            if (!lastDuePeriod || localComparePeriod(per, lastDuePeriod) > 0) {
+              lastDuePeriod = per;
+            }
+          }
+        }
+
+        const hasDebt = totalDueUpToNow > 0;
+
+        payload.__debt = {
+          periods,
+          summary: {
+            ...(base?.grandTotals || {}),
+            monthsDue,
+            totalBalanceDue: totalDueUpToNow,
+          },
+          from: base?.from || from || null,
+          to: base?.to || to || null,
+          nowPeriod,
+          totalDueUpToNow,
+          lastDuePeriod,
+          monthsDue,
+          hasDebt,
+          balance: totalDueUpToNow,
+          status: hasDebt ? "debe" : "al_dia",
+        };
+      } catch (e) {
+        console.warn("getClienteById: error calculando deuda", e);
+        // No rompemos el endpoint si falla deuda
+      }
     }
 
     return res.json(payload);
@@ -431,125 +535,240 @@ export async function getClienteById(req, res, next) {
   }
 }
 
-/* ===================================== LIST ===================================== */
-
-export async function listClientes(req, res, next) {
+// GET /clientes/:id/deuda  (vista ADMIN)
+export async function getClientDebtAdmin(req, res, next) {
   try {
-    const page = Math.max(parseInt(req.query.page) || 1, 1);
-    const limit = Math.min(parseInt(req.query.limit) || 10, 100);
-    const qRaw = (req.query.q || "").trim();
-
-    const onlyDigits = (s = "") => String(s).replace(/\D+/g, "");
-
-    // Filtros directos
-    const byIdClienteRaw = req.query.byIdCliente;
-    const byIdCliente =
-      byIdClienteRaw !== undefined && byIdClienteRaw !== ""
-        ? Number(byIdClienteRaw)
-        : undefined;
-    const hasByIdCliente = Number.isFinite(byIdCliente);
-
-    // DNI/documento (prioridad máxima)
-    const byDocumentoRaw = (req.query.byDocumento ?? "").toString().trim();
-    const byDocumentoDigits = onlyDigits(byDocumentoRaw);
-    const hasByDocumento = byDocumentoDigits.length >= 6;
-
-    const sortByParam = (req.query.sortBy || "createdAt").toString();
-    const sortDirParam = (req.query.sortDir || req.query.order || "desc")
-      .toString()
-      .toLowerCase();
-    const sortDir = sortDirParam === "asc" ? 1 : -1;
-
-    const SORTABLE = new Set([
-      "createdAt",
-      "idCliente",
-      "nombre",
-      "idCobrador",
-      "ingreso",
-      "cuota",
-      "cuotaIdeal",
-      "cuotaVigente",
-      "updatedAt",
-    ]);
-    const sortBy = SORTABLE.has(sortByParam) ? sortByParam : "createdAt";
-
-    // ===== ¿Necesitamos normalizar documento? =====
-    const needsDocDigits =
-      hasByDocumento || (qRaw && onlyDigits(qRaw).length >= 6);
-
-    // _docDigits = documento en string sin . - espacio /
-    const DOC_CLEAN_STR = { $toString: { $ifNull: ["$documento", ""] } }; // ← FIX clave
-    const DOC_DIGITS_EXPR = {
-      $replaceAll: {
-        input: {
-          $replaceAll: {
-            input: {
-              $replaceAll: {
-                input: {
-                  $replaceAll: {
-                    input: DOC_CLEAN_STR,
-                    find: ".",
-                    replacement: "",
-                  },
-                },
-                find: "-",
-                replacement: "",
-              },
-            },
-            find: " ",
-            replacement: "",
-          },
-        },
-        find: "/",
-        replacement: "",
-      },
-    };
-
-    // === Armar condiciones ===
-    const or = [];
-    const qDigits = onlyDigits(qRaw);
-    const isNumeric = /^\d+$/.test(qRaw);
-
-    if (hasByDocumento) {
-      // DNI directo: igualdad por dígitos normalizados + exacto tal cual
-      or.push({ $expr: { $eq: ["$_docDigits", byDocumentoDigits] } });
-      or.push({ documento: byDocumentoRaw });
-    } else if (hasByIdCliente) {
-      or.push({ idCliente: byIdCliente });
-    } else if (qRaw) {
-      // Global
-      or.push({ nombre: { $regex: qRaw, $options: "i" } });
-      or.push({ domicilio: { $regex: qRaw, $options: "i" } });
-      or.push({ documento: { $regex: qRaw, $options: "i" } });
-
-      if (isNumeric) {
-        or.push({ idCliente: Number(qRaw) });
-        or.push({ idCobrador: Number(qRaw) });
-        if (qDigits.length >= 6) {
-          or.push({ $expr: { $eq: ["$_docDigits", qDigits] } });
-        }
-      }
+    // ───────────────────── Permisos básicos ─────────────────────
+    const viewerRole = String(req.user?.role || "").trim();
+    if (!["admin", "superAdmin"].includes(viewerRole)) {
+      return res.status(403).json({
+        ok: false,
+        message: "Solo admin / superAdmin pueden ver la deuda detallada.",
+      });
     }
 
-    const matchStage = or.length > 0 ? { $or: or } : {};
+    const id = String(req.params.id || "").trim();
+    if (!isObjectId(id)) {
+      return res.status(400).json({ ok: false, message: "ID inválido" });
+    }
 
-    // ===== Pipelines =====
-    const preStages = [];
-    if (needsDocDigits)
-      preStages.push({ $addFields: { _docDigits: DOC_DIGITS_EXPR } });
-    if (Object.keys(matchStage).length) preStages.push({ $match: matchStage });
+    // Traemos un solo miembro (cliente)
+    const member = await Cliente.findById(id)
+      .select(
+        "_id idCliente nombre nombreTitular idCobrador usarCuotaIdeal cuota cuotaIdeal"
+      )
+      .lean();
 
-    // Conteo (por grupo)
-    const totalAgg = await Cliente.aggregate([
-      ...preStages,
-      { $group: { _id: "$idCliente" } },
-      { $count: "n" },
-    ]);
-    const total = totalAgg?.[0]?.n || 0;
+    if (!member) {
+      return res
+        .status(404)
+        .json({ ok: false, message: "Cliente no encontrado" });
+    }
 
-    // Items (1 por grupo)
-    const itemsAgg = Cliente.aggregate([
-      ...preStages,
+    // ───────────────────── Params de rango ─────────────────────
+    const { from, to, includeFuture } = req.query || {};
+
+    const base = await getClientPeriodState(member, {
+      from,
+      to,
+      includeFuture: Number(includeFuture),
+    });
+
+    let periods = Array.isArray(base?.periods) ? [...base.periods] : [];
+    const nowPeriod = yyyymmAR(new Date());
+
+    const cuotaVigente =
+      Number(member.usarCuotaIdeal ? member.cuotaIdeal : member.cuota) || 0;
+
+    // Suma ya imputada al período actual
+    const paidNowAgg = await Payment.aggregate([
+      { $match: { "cliente.memberId": new Types.ObjectId(member._id) } },
+      { $unwind: "$allocations" },
+      { $match: { "allocations.period": nowPeriod } },
+      {
+        $group: {
+          _id: null,
+          sum: {
+            $sum: {
+              $ifNull: ["$allocations.amountApplied", "$allocations.amount"],
+            },
+          },
+        },
+      },
+    ]).allowDiskUse(true);
+
+    const alreadyAppliedNow = Number(paidNowAgg?.[0]?.sum || 0);
+
+    // Ajustar / inyectar período actual
+    const idx = periods.findIndex((p) => p?.period === nowPeriod);
+    const computedBalanceNow = Math.max(0, cuotaVigente - alreadyAppliedNow);
+
+    if (idx === -1) {
+      periods.push({
+        period: nowPeriod,
+        charge: cuotaVigente,
+        paid: alreadyAppliedNow,
+        balance: computedBalanceNow,
+        status: computedBalanceNow > 0 ? "due" : "paid",
+      });
+    } else {
+      const cur = periods[idx] || {};
+      const charge = Number(cur.charge ?? cuotaVigente);
+      const paid = Math.max(Number(cur.paid || 0), alreadyAppliedNow);
+      const balance = Math.max(0, charge - paid);
+      periods[idx] = {
+        ...cur,
+        period: nowPeriod,
+        charge,
+        paid,
+        balance,
+        status: balance > 0 ? "due" : "paid",
+      };
+    }
+
+    const totalDueUpToNow = periods
+      .filter((p) => comparePeriod(p.period, nowPeriod) <= 0)
+      .reduce((acc, p) => acc + Math.max(0, Number(p.balance || 0)), 0);
+
+    return res.json({
+      ok: true,
+      clientId: String(member._id),
+      currency: "ARS",
+      from: base?.from || from || null,
+      to: base?.to || to || null,
+      grandTotals: base?.grandTotals || null,
+      periods: periods.sort((a, b) =>
+        a.period < b.period ? -1 : a.period > b.period ? 1 : 0
+      ),
+      summary: {
+        nowPeriod,
+        cuotaVigente,
+        alreadyAppliedNow,
+        balanceNow: computedBalanceNow,
+        totalDueUpToNow,
+      },
+    });
+  } catch (err) {
+    next(err);
+  }
+}
+// GET /clientes/collector-summary  (vista ADMIN o Cobrador)
+export async function getCollectorSummaryAdmin(req, res, next) {
+  try {
+    const viewerRole = String(req.user?.role || "").trim();
+    const myCollectorId = Number(req.user?.idCobrador);
+
+    // idCobrador a consultar: para admin puede venir por query; para cobrador, se fuerza el suyo
+    const targetIdRaw = req.query.idCobrador;
+    const targetId = targetIdRaw != null ? Number(targetIdRaw) : myCollectorId;
+
+    if (!Number.isFinite(targetId)) {
+      return res.status(400).json({
+        ok: false,
+        message: "Falta idCobrador válido.",
+      });
+    }
+
+    // Si es cobrador, sólo puede ver su propio resumen
+    if (
+      viewerRole === "cobrador" &&
+      Number.isFinite(myCollectorId) &&
+      myCollectorId !== targetId
+    ) {
+      return res.status(403).json({
+        ok: false,
+        message: "No podés ver el resumen de otro cobrador.",
+      });
+    }
+
+    // ───────────────────── Fecha / período actual ─────────────────────
+    const now = new Date();
+    const year = now.getFullYear();
+    const month = now.getMonth(); // 0–11
+    const period = yyyymmAR(now); // "YYYY-MM"
+
+    const monthStart = new Date(year, month, 1, 0, 0, 0, 0);
+    const monthEnd = new Date(year, month + 1, 0, 23, 59, 59, 999);
+
+    const daysInPeriod = new Date(year, month + 1, 0).getDate();
+    const daysElapsed = now.getDate();
+    const daysRemaining = Math.max(daysInPeriod - daysElapsed, 0);
+
+    // Días hábiles (lun–sáb) del mes
+    const countWorkingDays = () => {
+      let total = 0;
+      let elapsed = 0;
+
+      for (let d = 1; d <= daysInPeriod; d++) {
+        const dt = new Date(year, month, d);
+        const day = dt.getDay(); // 0 = dom, 1 = lun, ..., 6 = sáb
+        const isWorking = day >= 1 && day <= 6; // lun–sáb
+
+        if (!isWorking) continue;
+        total++;
+        if (d <= daysElapsed) elapsed++;
+      }
+      const remaining = Math.max(total - elapsed, 0);
+      return { total, elapsed, remaining };
+    };
+
+    const {
+      total: workingDaysTotal,
+      elapsed: workingDaysElapsed,
+      remaining: workingDaysRemaining,
+    } = countWorkingDays();
+
+    const diffInDays = (from, to) => {
+      const a = new Date(from);
+      const b = new Date(to);
+      if (Number.isNaN(a.getTime()) || Number.isNaN(b.getTime())) return 0;
+      const ms = b.getTime() - a.getTime();
+      return Math.max(0, Math.floor(ms / (1000 * 60 * 60 * 24)));
+    };
+
+    /* ───────────── Config de comisión (User del cobrador) ───────────── */
+
+    let baseCommissionRate = 0; // decimal (0.05 = 5%)
+    let graceDays = 7;
+    let penaltyPerDay = 0; // caída de la tasa por día extra
+
+    try {
+      // Buscamos el User que corresponde al cobrador target
+      const userDoc = await User.findOne({ idCobrador: targetId })
+        .select(
+          "porcentajeCobrador commissionGraceDays commissionPenaltyPerDay"
+        )
+        .lean();
+
+      const rawPercent = userDoc?.porcentajeCobrador;
+      if (typeof rawPercent === "number" && rawPercent > 0) {
+        baseCommissionRate = rawPercent <= 1 ? rawPercent : rawPercent / 100;
+      }
+
+      if (
+        userDoc &&
+        userDoc.commissionGraceDays != null &&
+        Number.isFinite(Number(userDoc.commissionGraceDays))
+      ) {
+        graceDays = Number(userDoc.commissionGraceDays);
+      }
+
+      const rawPenalty = userDoc?.commissionPenaltyPerDay;
+      if (typeof rawPenalty === "number" && rawPenalty > 0) {
+        penaltyPerDay = rawPenalty <= 1 ? rawPenalty : rawPenalty / 100;
+      }
+    } catch {
+      // si falla, dejamos los defaults suaves
+      baseCommissionRate = 0;
+      graceDays = 7;
+      penaltyPerDay = 0;
+    }
+
+    /* ───────────── Clientes asignados y cuota del mes ───────────── */
+
+    const clientsAgg = await Cliente.aggregate([
+      { $match: { idCobrador: targetId } },
+
       {
         $addFields: {
           createdAtSafe: { $ifNull: ["$createdAt", { $toDate: "$_id" }] },
@@ -568,17 +787,12 @@ export async function listClientes(req, res, next) {
           },
           _cuotaVigente: {
             $cond: [
-              {
-                $and: [
-                  { $toBool: { $ifNull: ["$usarCuotaIdeal", false] } },
-                  { $isNumber: "$cuotaIdeal" },
-                ],
-              },
-              "$cuotaIdeal",
+              { $eq: [{ $ifNull: ["$usarCuotaIdeal", false] }, true] },
+              { $ifNull: ["$cuotaIdeal", 0] },
               { $ifNull: ["$cuota", 0] },
             ],
           },
-          _isActive: {
+          __isActive: {
             $and: [
               { $ne: [{ $type: "$baja" }, "date"] },
               {
@@ -591,6 +805,7 @@ export async function listClientes(req, res, next) {
           },
         },
       },
+
       {
         $sort: {
           idCliente: 1,
@@ -600,90 +815,365 @@ export async function listClientes(req, res, next) {
           _id: 1,
         },
       },
+
       {
         $group: {
           _id: "$idCliente",
           firstDoc: { $first: "$$ROOT" },
-          integrantesCount: { $sum: { $cond: ["$_isActive", 1, 0] } },
-          cremacionesCount: {
-            $sum: {
-              $cond: [
-                { $and: ["$_isActive", { $toBool: "$cremacion" }] },
-                1,
-                0,
-              ],
-            },
+          cuotaVigente: { $first: "$_cuotaVigente" },
+          isActive: { $max: "$__isActive" },
+        },
+      },
+
+      { $match: { isActive: true } },
+
+      {
+        $group: {
+          _id: null,
+          assignedClients: { $sum: 1 },
+          totalChargeNow: { $sum: "$cuotaVigente" },
+        },
+      },
+    ]).allowDiskUse(true);
+
+    const assignedClients = clientsAgg?.[0]?.assignedClients || 0;
+    const totalChargeNow = clientsAgg?.[0]?.totalChargeNow || 0;
+
+    /* ───────────── Pagos del período + comisión pago a pago ───────────── */
+
+    const paymentsAgg = await Payment.aggregate([
+      {
+        $match: {
+          "collector.idCobrador": targetId,
+          status: { $in: ["posted", "settled"] },
+          $expr: {
+            $and: [
+              {
+                $gte: [{ $ifNull: ["$postedAt", "$createdAt"] }, monthStart],
+              },
+              {
+                $lte: [{ $ifNull: ["$postedAt", "$createdAt"] }, monthEnd],
+              },
+            ],
           },
-          edadMax: {
-            $max: {
-              $cond: [
-                "$_isActive",
-                {
-                  $cond: [
-                    { $isNumber: "$edad" },
-                    "$edad",
-                    { $ifNull: ["$edad", 0] },
-                  ],
-                },
-                0,
-              ],
-            },
-          },
-          createdAtSafe: { $min: "$createdAtSafe" },
-          updatedAtMax: { $max: "$updatedAt" },
+        },
+      },
+      { $unwind: "$allocations" },
+      {
+        $match: {
+          "allocations.period": period, // sólo lo imputado a este período
         },
       },
       {
         $project: {
-          _id: "$firstDoc._id",
-          idCliente: "$_id",
-          nombre: "$firstDoc.nombre",
-          nombreTitular: "$firstDoc.nombreTitular",
-          domicilio: "$firstDoc.domicilio",
-          ciudad: "$firstDoc.ciudad",
-          provincia: "$firstDoc.provincia",
-          cp: "$firstDoc.cp",
-          telefono: "$firstDoc.telefono",
-          documento: "$firstDoc.documento",
-          docTipo: "$firstDoc.docTipo",
-          sexo: "$firstDoc.sexo",
-          idCobrador: "$firstDoc.idCobrador",
-          cuota: "$firstDoc.cuota",
-          cuotaIdeal: "$firstDoc.cuotaIdeal",
-          usarCuotaIdeal: "$firstDoc.usarCuotaIdeal",
-          cuotaVigente: "$firstDoc._cuotaVigente",
-          parcela: "$firstDoc.parcela",
-          cremacion: "$firstDoc.cremacion",
-          activo: "$firstDoc.activo",
-          ingreso: "$firstDoc.ingreso",
-          vigencia: "$firstDoc.vigencia",
-          baja: "$firstDoc.baja",
-          createdAt: "$firstDoc.createdAt",
-          updatedAt: "$firstDoc.updatedAt",
-          rol: "$firstDoc.rol",
-          integrante: "$firstDoc.integrante",
-          integrantesCount: 1,
-          cremacionesCount: 1,
-          edadMax: 1,
-          createdAtSafe: 1,
-          updatedAtMax: 1,
+          _id: 1,
+          postedAt: { $ifNull: ["$postedAt", "$createdAt"] },
+          amountApplied: "$allocations.amountApplied",
+          "cliente.idCliente": 1,
+        },
+      },
+    ]).allowDiskUse(true);
+
+    const clientsSet = new Set();
+    let totalCollectedThisPeriod = 0;
+    let totalCommissionIdeal = 0;
+    let totalCommissionDiscounted = 0;
+
+    for (const p of paymentsAgg) {
+      const clientId = p.cliente?.idCliente;
+      if (clientId != null) clientsSet.add(clientId);
+
+      const applied = Number(p.amountApplied) || 0;
+      totalCollectedThisPeriod += applied;
+
+      const idealRate = baseCommissionRate;
+      const idealCommission = applied * idealRate;
+      totalCommissionIdeal += idealCommission;
+
+      let effectiveRate = idealRate;
+
+      if (idealRate > 0 && penaltyPerDay > 0 && p.postedAt) {
+        const daysHeld = diffInDays(p.postedAt, now);
+        if (daysHeld > graceDays) {
+          const extraDays = daysHeld - graceDays;
+          const reduction = penaltyPerDay * extraDays;
+          effectiveRate = Math.max(0, idealRate - reduction);
+        }
+      }
+
+      const discountedCommission = applied * effectiveRate;
+      totalCommissionDiscounted += discountedCommission;
+    }
+
+    const clientsWithPayment = clientsSet.size;
+    const clientsWithoutPayment = Math.max(
+      assignedClients - clientsWithPayment,
+      0
+    );
+
+    /* ───────────── Saldo en mano (Ledger) ───────────── */
+
+    const cashAccounts = ["CAJA_COBRADOR", "A_RENDIR_COBRADOR"];
+
+    const balanceAgg = await LedgerEntry.aggregate([
+      {
+        $match: {
+          "dimensions.idCobrador": targetId,
+          accountCode: { $in: cashAccounts },
         },
       },
       {
-        $sort:
-          sortBy === "createdAt"
-            ? { createdAtSafe: sortDir, _id: sortDir }
-            : { [sortBy]: sortDir, _id: sortDir },
+        $group: {
+          _id: null,
+          debits: {
+            $sum: {
+              $cond: [{ $eq: ["$side", "debit"] }, "$amount", 0],
+            },
+          },
+          credits: {
+            $sum: {
+              $cond: [{ $eq: ["$side", "credit"] }, "$amount", 0],
+            },
+          },
+        },
       },
-      { $skip: (page - 1) * limit },
-      { $limit: limit },
     ]).allowDiskUse(true);
 
-    const items = await itemsAgg;
+    const debits = balanceAgg?.[0]?.debits || 0;
+    const credits = balanceAgg?.[0]?.credits || 0;
+    const collectorBalance = debits - credits;
 
-    res.json({
+    /* ───────────── Comisiones globales ───────────── */
+
+    const expectedCommission = totalChargeNow * baseCommissionRate;
+    const currentCommission = totalCommissionDiscounted;
+
+    /* ───────────── Respuesta ───────────── */
+
+    const monthNamesEs = [
+      "enero",
+      "febrero",
+      "marzo",
+      "abril",
+      "mayo",
+      "junio",
+      "julio",
+      "agosto",
+      "septiembre",
+      "octubre",
+      "noviembre",
+      "diciembre",
+    ];
+    const label = `${monthNamesEs[month] || "Mes"} ${year}`.replace(
+      /^\w/,
+      (c) => c.toUpperCase()
+    );
+
+    return res.json({
+      ok: true,
+      data: {
+        idCobrador: targetId,
+        assignedClients,
+        month: {
+          period,
+          label,
+          daysInPeriod,
+          daysElapsed,
+          daysRemaining,
+          workingDaysTotal,
+          workingDaysElapsed,
+          workingDaysRemaining,
+          totalChargeNow,
+          totalCollectedThisPeriod,
+          clientsWithPayment,
+          clientsWithoutPayment,
+        },
+        balance: {
+          collectorBalance,
+        },
+        commissions: {
+          config: {
+            basePercent: baseCommissionRate,
+            graceDays,
+            penaltyPerDay,
+          },
+          amounts: {
+            expectedCommission,
+            totalCommission: currentCommission,
+            totalCommissionNoPenalty: totalCommissionIdeal,
+          },
+        },
+      },
+    });
+  } catch (err) {
+    next(err);
+  }
+}
+
+/* ===================================== LIST ===================================== */
+
+export async function listClientes(req, res, next) {
+  try {
+    const page = Math.max(parseInt(req.query.page) || 1, 1);
+    const limit = Math.min(parseInt(req.query.limit) || 10, 100);
+    const qRaw = (req.query.q || "").trim();
+
+    // ---- filtros directos ----
+    const byIdClienteRaw = req.query.byIdCliente;
+    const byIdCliente =
+      byIdClienteRaw !== undefined && byIdClienteRaw !== ""
+        ? Number(byIdClienteRaw)
+        : undefined;
+    const hasByIdCliente = Number.isFinite(byIdCliente);
+
+    const byDocumentoRaw = (req.query.byDocumento ?? "").toString().trim();
+    const hasByDocumento = byDocumentoRaw.length > 0;
+
+    // sort
+    const sortByParam = (req.query.sortBy || "createdAt").toString();
+    const sortDirParam = (req.query.sortDir || req.query.order || "desc")
+      .toString()
+      .toLowerCase();
+    const sortDir = sortDirParam === "asc" ? 1 : -1;
+
+    const SORTABLE = new Set([
+      "createdAt",
+      "idCliente",
+      "nombre",
+      "idCobrador",
+      "ingreso",
+      "cuota",
+      "cuotaIdeal",
+      "cuotaVigente", // lo mapeamos a cuota
+      "updatedAt",
+    ]);
+
+    let sortBy = SORTABLE.has(sortByParam) ? sortByParam : "createdAt";
+    if (sortBy === "cuotaVigente") {
+      // en modo simple, usamos cuota como aproximación
+      sortBy = "cuota";
+    }
+
+    const sortSpec = { [sortBy]: sortDir, _id: sortDir };
+
+    // ==========================
+    // Filtro base (simple)
+    // ==========================
+    const and = [];
+
+    // Por diseño, mostramos un solo miembro por grupo → TITULAR
+    and.push({ rol: "TITULAR" });
+
+    if (hasByDocumento) {
+      // simple: buscar documento por regex insensible
+      const esc = byDocumentoRaw.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      and.push({ documento: { $regex: esc, $options: "i" } });
+    } else if (hasByIdCliente) {
+      and.push({ idCliente: byIdCliente });
+    } else if (qRaw) {
+      const isNumeric = /^\d+$/.test(qRaw);
+      const esc = qRaw.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+      const or = [
+        { nombre: { $regex: esc, $options: "i" } },
+        { domicilio: { $regex: esc, $options: "i" } },
+        { documento: { $regex: esc, $options: "i" } },
+      ];
+
+      if (isNumeric) {
+        or.push({ idCliente: Number(qRaw) });
+        or.push({ idCobrador: Number(qRaw) });
+      }
+
+      and.push({ $or: or });
+    }
+
+    const filter = and.length ? { $and: and } : {};
+
+    // ==========================
+    // find + sort + skip + limit
+    // ==========================
+
+    const [docs, total] = await Promise.all([
+      Cliente.find(filter)
+        .sort(sortSpec)
+        .skip((page - 1) * limit)
+        .limit(limit)
+        .lean(),
+      // este count es barato, NO usa sort ni aggregate gordo
+      Cliente.countDocuments(filter),
+    ]);
+
+    // Si NO te interesa __debt en el listado, podés devolver docs directo
+    const nowPeriod = yyyymmAR(new Date());
+
+    const items = await Promise.all(
+      docs.map(async (it) => {
+        try {
+          // cuotaVigente rápido
+          const cuotaVigente =
+            it.usarCuotaIdeal && typeof it.cuotaIdeal === "number"
+              ? it.cuotaIdeal
+              : it.cuota;
+
+          // Si querés evitar E/S extra, comentá todo el bloque __debt
+          const member = await Cliente.findById(it._id).lean();
+          if (!member) {
+            return { ...it, cuotaVigente };
+          }
+
+          const debtState = await getClientPeriodState(member, {
+            to: nowPeriod,
+            includeFuture: 0,
+          });
+
+          const periods = Array.isArray(debtState?.periods)
+            ? debtState.periods
+            : [];
+
+          const totalDueUpToNow = periods
+            .filter((p) => comparePeriod(p.period, nowPeriod) <= 0)
+            .reduce((acc, p) => acc + Math.max(0, Number(p.balance || 0)), 0);
+
+          let lastDuePeriod = null;
+          for (const p of periods) {
+            const per = p.period;
+            const bal = Number(p.balance || 0);
+            if (bal <= 0) continue;
+            if (comparePeriod(per, nowPeriod) <= 0) {
+              if (!lastDuePeriod || comparePeriod(per, lastDuePeriod) > 0) {
+                lastDuePeriod = per;
+              }
+            }
+          }
+
+          const hasDebt = totalDueUpToNow > 0;
+
+          return {
+            ...it,
+            cuotaVigente,
+            __debt: {
+              nowPeriod,
+              totalDueUpToNow,
+              lastDuePeriod,
+              hasDebt,
+              balance: totalDueUpToNow,
+              status: hasDebt ? "debe" : "al_dia",
+            },
+          };
+        } catch (e) {
+          console.warn("listClientes(simple): error calculando deuda", {
+            id: it._id,
+            err: e,
+          });
+          return it;
+        }
+      })
+    );
+
+    return res.json({
       items,
-      total,
+      total, // si querés “no calcular total”, podés mandar null y listo
       page,
       pageSize: limit,
       sortBy,

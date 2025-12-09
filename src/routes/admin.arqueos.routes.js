@@ -12,12 +12,15 @@ import {
   crearArqueoUsuario, // Crear arqueo/corte manual
   exportCollectorClientsCSV, // CSV de clientes por cobrador
 
-  // ➕ NUEVOS controladores de caja chica / grande
+  // ➕ controladores de caja chica / grande
   depositoCajaChica, // admin → su CAJA_CHICA
   ingresoCajaGrande, // superAdmin: CAJA_CHICA (admin) → CAJA_GRANDE (SA)
   extraccionCajaGrande, // superAdmin: CAJA_GRANDE → CAJA_SUPERADMIN
   getGlobalCajasBalance,
   getArqueoGlobalTotals,
+
+  // ➕ NUEVO: resumen de comisiones de un cobrador (para admin)
+  getCollectorCommissionSummaryAdmin,
 } from "../controllers/admin-arqueos.controller.js";
 
 const router = Router();
@@ -77,6 +80,25 @@ router.post(
   crearArqueoUsuario
 );
 
+/**
+ * Resumen de comisiones de un cobrador (para panel admin)
+ *
+ * GET /api/admin/arqueos/usuarios/comision-resumen
+ *
+ * Query:
+ *  - userId     (opcional, _id Mongo del User cobrador)
+ *  - idCobrador (opcional, numérico; si no viene userId)
+ *  - dateFrom   (YYYY-MM-DD, opcional)
+ *  - dateTo     (YYYY-MM-DD, opcional)
+ *    Si no se envía rango, usa el mes actual completo.
+ */
+router.get(
+  "/admin/arqueos/usuarios/comision-resumen",
+  requireSession,
+  adminOnly,
+  getCollectorCommissionSummaryAdmin
+);
+
 /* =========================================================================
  *  NUEVAS RUTAS — Caja chica / Caja grande
  * ========================================================================= */
@@ -115,16 +137,19 @@ router.post(
   superAdminOnly,
   extraccionCajaGrande
 );
+
 router.get(
   "/admin/arqueos/global-cajas-balance",
   requireSession,
   adminOnly,
   getGlobalCajasBalance
 );
+
 router.get(
   "/admin/arqueos/global-totals",
   requireSession,
   adminOnly, // o superAdminOnly si querés restringirlo
   getArqueoGlobalTotals
 );
+
 export default router;

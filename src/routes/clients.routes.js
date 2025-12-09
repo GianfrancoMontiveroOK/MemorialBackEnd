@@ -7,6 +7,8 @@ import {
   updateCliente,
   deleteCliente,
   getClientesStats,
+  getClientDebtAdmin,
+  getCollectorSummaryAdmin,
 } from "../controllers/clients.controller.js";
 
 const router = Router();
@@ -56,10 +58,21 @@ router.use(requireAuth);
 
 // ---- SOLO admin/superAdmin ----
 router.get("/stats", requireAdminOrSuperAdmin, getClientesStats);
+
+// resumen admin de un cobrador (comisiones, KPIs, etc.)
+router.get(
+  "/collector-summary",
+  requireAdminOrSuperAdmin,
+  getCollectorSummaryAdmin
+);
+
 router.get("/", requireAdminOrSuperAdmin, listClientes);
 router.post("/", requireAdminOrSuperAdmin, createCliente);
 router.put("/:id", requireAdminOrSuperAdmin, updateCliente);
 router.delete("/:id", requireAdminOrSuperAdmin, deleteCliente);
+
+// deuda detallada del cliente (solo admin/superAdmin)
+router.get("/:id/deuda", requireAdminOrSuperAdmin, getClientDebtAdmin);
 
 // ---- GET /:id accesible a cobrador (con redacción) y a admin/superAdmin (completo) ----
 router.get("/:id", allowGetOneForCobrador, getClienteById);

@@ -14,10 +14,49 @@ export const safeNumber = (v, def = 0) =>
   Number.isFinite(Number(v)) ? Number(v) : def;
 
 /* ============ Contabilidad (ajustá a tu mapa/ERP) ============ */
+/**
+ * Plan de cuentas lógico de Memorial (no es el plan contable completo,
+ * solo las cuentas que el sistema necesita conocer para asientos automáticos).
+ *
+ * OJO: los nombres (values) son los códigos que van a LedgerEntry.accountCode.
+ */
 export const ACCOUNTS = Object.freeze({
+  // 💵 Cajas de cobradores de campo
   CAJA_COBRADOR: "CAJA_COBRADOR",
+
+  // 💵 Cajas de oficina
+  CAJA_ADMIN: "CAJA_ADMIN",
+  CAJA_SUPERADMIN: "CAJA_SUPERADMIN",
+
+  // 📈 Resultados
   INGRESOS_CUOTAS: "INGRESOS_CUOTAS",
+
+  // 🏦 Medios de cobro / bancos
+  BANCO_NACION: "BANCO_NACION",
+  TARJETA_NARANJA: "TARJETA_NARANJA",
 });
+
+/**
+ * Mapa rol → cuenta de caja principal.
+ *
+ * Esto evita tener que hardcodear strings en cada controlador.
+ * Si mañana cambiás la lógica (p. ej. superAdmin usa otra caja),
+ * tocás solo acá.
+ */
+export const CASH_ROLE_ACCOUNT = Object.freeze({
+  cobrador: ACCOUNTS.CAJA_COBRADOR,
+  admin: ACCOUNTS.CAJA_ADMIN,
+  superAdmin: ACCOUNTS.CAJA_SUPERADMIN,
+});
+
+/**
+ * Devuelve la cuenta de caja que corresponde al rol de usuario.
+ * Fallback: CAJA_COBRADOR si el rol no está mapeado.
+ */
+export function getCashAccountForRole(role) {
+  const key = String(role || "").trim();
+  return CASH_ROLE_ACCOUNT[key] || ACCOUNTS.CAJA_COBRADOR;
+}
 
 /* ============ Proyección whitelisted para vista cobrador ============ */
 export const projectCollector = {
@@ -75,6 +114,41 @@ export const comparePeriod = (a, b) => {
 /* ============ Utilidades allocations ============ */
 export const sumAllocations = (allocs = []) =>
   allocs.reduce((acc, x) => acc + (Number(x?.amount) || 0), 0);
+
+/**
+ * Devuelve la lista de períodos vencidos (con balance > 0)
+ * hasta nowPeriod (inclusive), ordenados ascendente (viejo → nuevo).
+ *
+ * SUPOSICIÓN: debtState tiene forma:
+ * { periods: [{ period: "YYYY-MM", balance: Number }, ...] }
+ */
+export function getDuePeriodsUntilNow(debtState, nowPeriod) {
+  const np = normalizePeriod(nowPeriod);
+  if (!np) return [];
+
+  const periods = Array.isArray(debtState?.periods) ? debtState.periods : [];
+
+  return periods
+    .filter((p) => {
+      const per = normalizePeriod(p?.period);
+      const bal = safeNumber(p?.balance, 0);
+      return per && bal > 0 && comparePeriod(per, np) <= 0;
+    })
+    .map((p) => p.period)
+    .sort((a, b) => (a < b ? -1 : 1)); // asc (viejo → nuevo)
+}
+
+/**
+ * Cantidad de meses en atraso (períodos vencidos con balance > 0)
+ * hasta nowPeriod inclusive.
+ *
+ * Esto NO aplica ninguna regla de negocio (3 meses, 4 meses, etc.),
+ * solo devuelve el número de períodos adeudados. La regla se maneja
+ * en los controladores de pago.
+ */
+export function countArrearsMonths(debtState, nowPeriod) {
+  return getDuePeriodsUntilNow(debtState, nowPeriod).length;
+}
 
 /* ============ FIFO hasta nowPeriod (sin futuros) ============ */
 export function fifoAllocateUntilNow(debtState, nowPeriod, amount) {

@@ -13,7 +13,7 @@ import {
   projectCollector,
   yyyymmAR,
   comparePeriod,
-} from "./collector.shared.js";
+} from "./payments.shared.js";
 
 const { Types } = mongoose;
 
@@ -26,9 +26,6 @@ export async function listCollectorClients(req, res, next) {
         .status(400)
         .json({ ok: false, message: "Falta idCobrador en la sesión." });
     }
-
-    // full=1 => trae todo (sin skip/limit) para paginar/filtrar en UI
-    const FULL = String(req.query.full || "") === "1";
 
     const page = Math.max(toInt(req.query.page, 1), 1);
     const limit = Math.min(toInt(req.query.limit, 25), 100);
@@ -259,7 +256,7 @@ export async function listCollectorClients(req, res, next) {
                   in: { $add: [{ $multiply: ["$$y", 100] }, "$$m"] },
                 },
               },
-              { $subtract: [NOW_NUM, 1] }, // ⬅️ SIN pagos: se considera atrasado (al menos 1 mes)
+              { $subtract: [NOW_NUM, 1] }, // SIN pagos: se considera atrasado (al menos 1 mes)
             ],
           },
         },
@@ -280,9 +277,7 @@ export async function listCollectorClients(req, res, next) {
         },
       },
 
-      // estado actual:
-      // - paid si cubrió el mes actual (paidNow >= chargeNow) o si está adelantado (__maxNum > NOW_NUM)
-      // - sino due
+      // estado actual
       {
         $addFields: {
           "billing.current": {
@@ -300,7 +295,7 @@ export async function listCollectorClients(req, res, next) {
         },
       },
 
-      // orden final
+      // orden final (sobre grupos)
       {
         $sort:
           sortBy === "createdAt"
@@ -308,8 +303,9 @@ export async function listCollectorClients(req, res, next) {
             : { [sortBy]: sortDirParam, _id: sortDirParam },
       },
 
-      // paginación solo si NO es full
-      ...(!FULL ? [{ $skip: (page - 1) * limit }, { $limit: limit }] : []),
+      // ⬅️ paginación SIEMPRE
+      { $skip: (page - 1) * limit },
+      { $limit: limit },
 
       // proyección final (incluye billing)
       { $project: PROJECT_FINAL },
@@ -329,11 +325,10 @@ export async function listCollectorClients(req, res, next) {
       ok: true,
       items,
       total,
-      page: FULL ? 1 : page,
-      pageSize: FULL ? items.length : limit,
+      page,
+      pageSize: limit,
       sortBy,
       sortDir: sortDirParam === 1 ? "asc" : "desc",
-      full: FULL ? 1 : 0,
     });
   } catch (err) {
     next(err);
@@ -514,7 +509,6 @@ export async function getCollectorClientDebt(req, res, next) {
   }
 }
 
-
 export async function getCollectorSummary(req, res, next) {
   try {
     const myCollectorId = Number(req.user?.idCobrador);
@@ -572,9 +566,10 @@ export async function getCollectorSummary(req, res, next) {
 
     /* ────────────────────── Config de comisión (User) ────────────────────── */
 
-    let baseCommissionRate = 0; // decimal (0.05 = 5 %)
-    let graceDays = 7;
-    let penaltyPerDay = 0; // caída de tasa por día extra, decimal
+    // ✅ Defaults seguros
+    let baseCommissionRate = 0; // 0.05 = 5 %
+    let graceDays = 7; // días de gracia
+    let penaltyPerDay = 0; // 0 = sin penalidad
 
     try {
       const userDoc = await User.findById(req.user._id)
@@ -583,28 +578,29 @@ export async function getCollectorSummary(req, res, next) {
         )
         .lean();
 
-      // Porcentaje principal (soporta 5 o 0.05)
-      const rawPercent = userDoc?.porcentajeCobrador;
-      if (typeof rawPercent === "number" && rawPercent > 0) {
-        baseCommissionRate = rawPercent <= 1 ? rawPercent : rawPercent / 100;
-      }
+      if (userDoc) {
+        // Porcentaje principal (soporta 5 o 0.05)
+        const rawPercent = userDoc.porcentajeCobrador;
+        if (typeof rawPercent === "number" && rawPercent > 0) {
+          baseCommissionRate = rawPercent <= 1 ? rawPercent : rawPercent / 100;
+        }
 
-      // Días de gracia configurables
-      if (
-        userDoc &&
-        userDoc.commissionGraceDays != null &&
-        Number.isFinite(Number(userDoc.commissionGraceDays))
-      ) {
-        graceDays = Number(userDoc.commissionGraceDays);
-      }
+        // Días de gracia configurables
+        if (
+          userDoc.commissionGraceDays != null &&
+          Number.isFinite(Number(userDoc.commissionGraceDays))
+        ) {
+          graceDays = Number(userDoc.commissionGraceDays);
+        }
 
-      // Penalidad por día (soporta 0.1 = 10% de la tasa por día, o 10 = 10% también)
-      const rawPenalty = userDoc?.commissionPenaltyPerDay;
-      if (typeof rawPenalty === "number" && rawPenalty > 0) {
-        penaltyPerDay = rawPenalty <= 1 ? rawPenalty : rawPenalty / 100;
+        // Penalidad por día (soporta 0.1 = 10% de la tasa por día, o 10 = 10% también)
+        const rawPenalty = userDoc.commissionPenaltyPerDay;
+        if (typeof rawPenalty === "number" && rawPenalty > 0) {
+          penaltyPerDay = rawPenalty <= 1 ? rawPenalty : rawPenalty / 100;
+        }
       }
     } catch {
-      // Si falla, usamos defaults suaves
+      // Si falla el lookup, mantenemos defaults suaves
       baseCommissionRate = 0;
       graceDays = 7;
       penaltyPerDay = 0;
@@ -715,7 +711,7 @@ export async function getCollectorSummary(req, res, next) {
           _id: 1,
           postedAt: { $ifNull: ["$postedAt", "$createdAt"] },
           amountApplied: "$allocations.amountApplied",
-          "cliente.idCliente": 1,
+          cliente: 1,
         },
       },
     ]).allowDiskUse(true);
@@ -796,11 +792,7 @@ export async function getCollectorSummary(req, res, next) {
     // Ganancia esperada: si cobrara toda la cartera en término
     const expectedCommission = totalChargeNow * baseCommissionRate;
 
-    // Ganancia actual:
-    // - totalCommissionIdeal: lo que sería si todos los pagos del período
-    //   mantuvieran el % completo.
-    // - totalCommissionDiscounted: lo que realmente corresponde hoy,
-    //   aplicando la caída por días de más con el dinero.
+    // Ganancia actual (con penalidad aplicada pago a pago)
     const currentCommission = totalCommissionDiscounted;
 
     /* ────────────────────── Armado de respuesta ────────────────────── */

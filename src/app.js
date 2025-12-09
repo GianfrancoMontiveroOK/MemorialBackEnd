@@ -27,6 +27,7 @@ import adminOutboxRoutes from "./routes/admin.outbox.routes.js";
 import adminArqueosRoutes from "./routes/admin.arqueos.routes.js";
 import adminStatsRoutes from "./routes/admin.stats.routes.js";
 import adminItemsRoutes from "./routes/admin.items.routes.js";
+import adminPaymentsRoutes from "./routes/admin.payments.routes.js";
 dotenv.config();
 
 const app = express();
@@ -137,6 +138,7 @@ app.use("/api", adminLedgerRoutes);
 app.use("/api", adminOutboxRoutes);
 app.use("/api", adminArqueosRoutes);
 app.use("/api", adminStatsRoutes);
+app.use("/api/admin", adminPaymentsRoutes);
 app.use("/admin/items", adminItemsRoutes);
 // 404
 app.use((req, res) => {

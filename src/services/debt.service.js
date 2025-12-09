@@ -3,8 +3,8 @@ import Payment from "../models/payment.model.js";
 import { toYYYYMM, rangePeriods, nextPeriod } from "./periods.util.js";
 
 /* ================== Parámetros de facturación (MVP) ================== */
-const GO_LIVE_PERIOD = "2025-10"; // primer período facturable del sistema
-const DUE_DAY = 10; // antes del día 10, el mes corriente está "open" (no due)
+const GO_LIVE_PERIOD = "2025-10"; // primer período facturable del sistema (igual para todos)
+const DUE_DAY = 1; // antes del día 10, el mes corriente está "open" (no due)
 
 /* ================== Helpers ================== */
 function getQuotaFor(clienteDoc) {
@@ -14,6 +14,7 @@ function getQuotaFor(clienteDoc) {
   const val = Number(q || 0);
   return Number.isFinite(val) && val > 0 ? Math.round(val) : 0;
 }
+
 const maxPeriod = (a, b) => (!a ? b : !b ? a : a > b ? a : b);
 const minPeriod = (a, b) => (!a ? b : !b ? a : a < b ? a : b);
 
@@ -28,9 +29,14 @@ function clampByRange(periods, { from, to }) {
 /**
  * getClientPeriodState(clienteDoc, opts)
  * opts:
- *  - from: "YYYY-MM" (no menor a billableFrom)
+ *  - from: "YYYY-MM" (no menor a GO_LIVE_PERIOD)
  *  - to: "YYYY-MM"   (default: período actual)
  *  - includeFuture: number (default: 1)
+ *
+ * Todos los clientes empiezan a facturar desde GO_LIVE_PERIOD.
+ * La deuda real se determina comparando:
+ *   - períodos generados [GO_LIVE_PERIOD..hoy]
+ *   - pagos imputados (Payment.allocations) por período.
  *
  * return:
  *  {
@@ -42,37 +48,35 @@ function clampByRange(periods, { from, to }) {
 export async function getClientPeriodState(clienteDoc, opts = {}) {
   const now = new Date();
   const todayP = toYYYYMM(now);
-  const quota = getQuotaFor(clienteDoc);
+  const quota = getQuotaFor(clienteDoc); // usa cuota / cuotaIdeal según cliente
 
+  // Cuántos períodos futuros agregamos al final (0 = solo hasta hoy)
   const includeFuture = Number.isFinite(opts.includeFuture)
     ? Math.max(0, opts.includeFuture)
     : 1;
 
-  // Alta del cliente -> usar vigencia si existe; si no, createdAt; fallback today
-  const onboardingP = clienteDoc?.vigencia
-    ? toYYYYMM(new Date(clienteDoc.vigencia))
-    : clienteDoc?.createdAt
-    ? toYYYYMM(new Date(clienteDoc.createdAt))
-    : todayP;
-
-  // 1) Primer período facturable
-  const billableFrom = maxPeriod(onboardingP, GO_LIVE_PERIOD);
+  // 1) Primer período facturable global del sistema
+  const billableFrom = GO_LIVE_PERIOD; // ej: "2025-10"
 
   // 2) Ventana solicitada (clamp)
+  //    from nunca puede ser menor a GO_LIVE_PERIOD
   const requestedFrom = opts.from || billableFrom;
   const baseFrom = maxPeriod(requestedFrom, billableFrom);
+
+  //    to no puede ser mayor al mes corriente (todayP)
   const baseTo = opts.to ? minPeriod(opts.to, todayP) : todayP;
 
   // 3) Períodos base [baseFrom..baseTo]
   const basePeriods = baseFrom <= baseTo ? rangePeriods(baseFrom, baseTo) : [];
 
-  // 4) Futuros
+  // 4) Períodos futuros (opcionales)
   const futurePeriods = [];
   let p = nextPeriod(baseTo);
   for (let i = 0; i < includeFuture; i++) {
     futurePeriods.push(p);
     p = nextPeriod(p);
   }
+
   const allPeriods = [...basePeriods, ...futurePeriods];
 
   // 5) Pagos por período del miembro (solo posted/settled)
@@ -82,10 +86,13 @@ export async function getClientPeriodState(clienteDoc, opts = {}) {
       "allocations.0": { $exists: true },
       status: { $in: ["posted", "settled"] },
     },
-    { allocations: 1 }
+    {
+      allocations: 1,
+    }
   ).lean();
 
   const paidByPeriod = new Map(); // period -> sum(amountApplied)
+
   for (const pay of payments) {
     for (const a of pay.allocations || []) {
       if (!a?.period || typeof a.amountApplied !== "number") continue;
@@ -96,27 +103,31 @@ export async function getClientPeriodState(clienteDoc, opts = {}) {
     }
   }
 
-  // 6) Clasificación período a período  ->  { period, charge, paid, balance, status }
+  // 6) Clasificación período a período -> { period, charge, paid, balance, status }
   const periods = allPeriods.map((period) => {
     const isFuture = period > baseTo;
 
-    const charge = quota; // monto de cuota por período
-    const paid = paidByPeriod.get(period) || 0; // aplicado a ese período
+    // Monto de cuota por período
+    const charge = quota;
+    // Pagos aplicados a ese período
+    const paid = paidByPeriod.get(period) || 0;
+
     let status = "due";
     let balance = charge - paid; // puede ser < 0 (crédito)
 
     if (isFuture) {
-      // Futuros no son deuda. Si hubo pagos a cuenta, marcamos credit
+      // Futuros no son deuda.
       if (paid > 0) {
+        // Pagos a cuenta al futuro => crédito
         status = "credit";
-        // balance ya refleja crédito si es negativo; dejamos así
+        // balance ya refleja el crédito si es negativo
         return { period, charge, paid, balance, status };
       }
-      // futuro sin pagos: neutral
+      // Futuro sin pagos: neutral
       return { period, charge, paid: 0, balance: 0, status: "future" };
     }
 
-    // No futuro:
+    // Períodos hasta baseTo (facturables)
     if (charge === 0 && paid === 0) {
       status = "paid";
       balance = 0;
@@ -134,7 +145,8 @@ export async function getClientPeriodState(clienteDoc, opts = {}) {
     return { period, charge, paid, balance, status };
   });
 
-  // 7) Regla de vencimiento: mes corriente antes del DUE_DAY => "open" (no due)
+  // 7) Regla de vencimiento:
+  //    mes corriente antes del DUE_DAY => "open" (no due)
   const day = now.getDate();
   if (day < DUE_DAY) {
     const idx = periods.findIndex((x) => x.period === todayP);
@@ -150,16 +162,19 @@ export async function getClientPeriodState(clienteDoc, opts = {}) {
   const debtRows = periods.filter(
     (r) => r.status === "due" || r.status === "partial"
   );
+
   const monthsDue = debtRows.length;
+
   const totalBalanceDue = debtRows.reduce(
     (acc, r) => acc + Math.max(0, r.balance || 0),
     0
   );
 
-  // Crédito global (solo períodos facturables)
+  // Crédito global (solo períodos facturables: hasta baseTo)
   const facturableRows = periods.filter((r) => r.period <= baseTo);
   const sumDue = facturableRows.reduce((acc, r) => acc + (r.charge || 0), 0);
   const sumPaid = facturableRows.reduce((acc, r) => acc + (r.paid || 0), 0);
+
   const creditAmount = Math.max(0, sumPaid - sumDue);
   const hasCredit = creditAmount > 0;
 

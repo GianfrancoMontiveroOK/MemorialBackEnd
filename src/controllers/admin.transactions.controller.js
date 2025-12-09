@@ -181,6 +181,7 @@ export async function listAllPayments(req, res, next) {
       "status",
     ]);
     const sortBy = SORTABLE.has(sortByParam) ? sortByParam : "postedAt";
+
     const sortStage =
       sortBy === "postedAt"
         ? { $sort: { postedAt: sortDirParam, _id: sortDirParam } }
@@ -206,14 +207,19 @@ export async function listAllPayments(req, res, next) {
       meta: 1,
     };
 
+    const listPipeline = [
+      { $match: match },
+      sortStage,
+      { $skip: (page - 1) * limit },
+      { $limit: limit },
+      { $project: project },
+    ];
+
+    const listAgg = Payment.aggregate(listPipeline);
+    listAgg.allowDiskUse(true);
+
     const [items, count] = await Promise.all([
-      Payment.aggregate([
-        { $match: match },
-        sortStage,
-        { $skip: (page - 1) * limit },
-        { $limit: limit },
-        { $project: project },
-      ]).allowDiskUse(true),
+      listAgg,
       Payment.countDocuments(match),
     ]);
 
@@ -247,6 +253,7 @@ export async function listAllPayments(req, res, next) {
     next(err);
   }
 }
+
 /* ========================= Helpers de archivos ========================= */
 
 async function readUploadedTextFile(file) {

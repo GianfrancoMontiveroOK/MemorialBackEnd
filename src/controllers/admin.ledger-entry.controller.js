@@ -43,6 +43,7 @@ const SORT_ALLOWLIST = new Set([
   "toUserName",
 ]);
 
+
 export async function listAdminLedgerEntries(req, res) {
   try {
     const {
@@ -229,9 +230,14 @@ export async function listAdminLedgerEntries(req, res) {
             {
               $cond: [
                 {
-                  $in: [
-                    { $type: "$dimensions.idCobrador" },
-                    ["missing", "null"],
+                  $or: [
+                    {
+                      $in: [
+                        { $type: "$dimensions.idCobrador" },
+                        ["missing", "null"],
+                      ],
+                    },
+                    { $eq: ["$dimensions.idCobrador", 0] }, // idCobrador = 0 => sin cobrador
                   ],
                 },
                 null,
@@ -245,6 +251,7 @@ export async function listAdminLedgerEntries(req, res) {
             },
           ],
         },
+
         _clienteName: {
           $ifNull: [
             { $first: "$titularCliente.nombre" },
@@ -277,7 +284,7 @@ export async function listAdminLedgerEntries(req, res) {
       },
     });
 
-    // Reglas FROM/TO (tus fixes incluidos)
+    // Reglas FROM/TO
     const G_CHICA = "CAJA_CHICA (GLOBAL)";
     const G_GRANDE = "CAJA_GRANDE (GLOBAL)";
     const G_SUPERADMIN = "CAJA_SUPERADMIN";
@@ -366,7 +373,15 @@ export async function listAdminLedgerEntries(req, res) {
                     { $eq: ["$side", "debit"] },
                   ],
                 },
-                then: { $ifNull: ["$_cobradorName", "$_adminName"] },
+                // 👇 Débito de CAJA_ADMIN: del cliente → usuario (fallback cobrador/admin)
+                then: {
+                  $ifNull: [
+                    "$_clienteName",
+                    {
+                      $ifNull: ["$_cobradorName", "$_adminName"],
+                    },
+                  ],
+                },
               },
               {
                 case: {
@@ -480,6 +495,7 @@ export async function listAdminLedgerEntries(req, res) {
                     { $eq: ["$side", "debit"] },
                   ],
                 },
+                // 👇 acá vuelve a ser simplemente la caja/admin (entra a la caja del usuario)
                 then: { $ifNull: ["$_adminName", "CAJA_ADMIN"] },
               },
               {
@@ -634,12 +650,11 @@ export async function listAdminLedgerEntries(req, res) {
     });
   } catch (err) {
     console.error("listAdminLedgerEntries error:", err);
-    res
-      .status(500)
-      .json({
-        ok: false,
-        message: "Error al listar el libro mayor.",
-        error: err?.message,
-      });
+    res.status(500).json({
+      ok: false,
+      message: "Error al listar el libro mayor.",
+      error: err?.message,
+    });
   }
 }
+
