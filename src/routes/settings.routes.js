@@ -27,7 +27,6 @@ const router = Router();
 router.get(
   "/price-rules",
   requireAuth,
-  requireSuperAdmin,
   async (_req, res) => {
     try {
       const rules = await getGlobalPriceRules({ force: true });
