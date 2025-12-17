@@ -3,49 +3,62 @@ import mongoose from "mongoose";
 import LedgerEntry from "../models/ledger-entry.model.js";
 import Payment from "../models/payment.model.js";
 import User from "../models/user.model.js";
-import Cliente from "../models/client.model.js";
 
-const toInt = (v, d = undefined) => {
+const toInt = (v) => {
+  if (v == null || v === "") return undefined;
   const n = Number(v);
-  return Number.isFinite(n) ? n : d;
+  return Number.isFinite(n) ? Math.trunc(n) : undefined;
 };
+
 const toFloat = (v) => {
-  if (v === "" || v == null) return undefined;
+  if (v == null || v === "") return undefined;
   const n = Number(v);
   return Number.isFinite(n) ? n : undefined;
 };
+
 const toBool = (v, def = false) => {
   if (typeof v === "boolean") return v;
-  const s = String(v).toLowerCase();
-  if (["1", "true", "yes"].includes(s)) return true;
-  if (["0", "false", "no"].includes(s)) return false;
+  if (v == null || v === "") return def;
+  const s = String(v).toLowerCase().trim();
+  if (["1", "true", "yes", "y", "si"].includes(s)) return true;
+  if (["0", "false", "no", "n"].includes(s)) return false;
   return def;
 };
-const isObjectIdLike = (s) => {
-  try {
-    new mongoose.Types.ObjectId(s);
-    return true;
-  } catch {
-    return false;
-  }
+
+const isObjectIdLike = (v) =>
+  typeof v === "string" && /^[a-fA-F0-9]{24}$/.test(v);
+
+const escapeRegex = (s) => String(s).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+const debitExpr = {
+  $sum: { $cond: [{ $eq: ["$side", "debit"] }, "$amount", 0] },
+};
+const creditExpr = {
+  $sum: { $cond: [{ $eq: ["$side", "credit"] }, "$amount", 0] },
 };
 
+// sort fields válidos (incluye fromUser/toUser que están en root)
 const SORT_ALLOWLIST = new Set([
   "postedAt",
+  "createdAt",
   "amount",
-  "side",
+  "currency",
   "accountCode",
+  "side",
+  "kind",
+  "fromUser",
+  "toUser",
+  "fromAccountCode",
+  "toAccountCode",
   "dimensions.idCobrador",
   "dimensions.idCliente",
-  "createdAt",
-  // para FE
-  "fromUserName",
-  "toUserName",
+  // calculado via lookup actor (si includeActor=1 o si lo necesitamos)
+  "actorUserName",
 ]);
-
 
 export async function listAdminLedgerEntries(req, res) {
   try {
+    // ───────────────────────── Query params ─────────────────────────
     const {
       q = "",
       dateFrom,
@@ -60,8 +73,9 @@ export async function listAdminLedgerEntries(req, res) {
       maxAmount,
       method,
       status,
-      userId,
+      userId, // actor (userId del asiento)
       includePayment = "0",
+      includeActor = "0", // 🆕 opcional: para devolver actorUserName siempre
       sortBy = "postedAt",
       sortDir = "desc",
       page = 1,
@@ -73,9 +87,18 @@ export async function listAdminLedgerEntries(req, res) {
     const _limit = Math.min(Number(pageSize ?? limit ?? 25) || 25, 200);
     const _skip = (_page - 1) * _limit;
 
+    const includePaymentFlag = toBool(includePayment, false);
+    const includeActorFlag = toBool(includeActor, false);
+
+    const needPaymentJoin = includePaymentFlag || !!method || !!status;
+
+    const _sortDir = String(sortDir).toLowerCase() === "asc" ? 1 : -1;
+    const _sortBy = SORT_ALLOWLIST.has(sortBy) ? sortBy : "postedAt";
+
+    // ───────────────────────── Match base ─────────────────────────
     const matchAnd = [];
 
-    // rango de fechas
+    // fechas
     if (dateFrom) {
       const d = new Date(dateFrom);
       if (!Number.isNaN(d.getTime())) matchAnd.push({ postedAt: { $gte: d } });
@@ -83,6 +106,7 @@ export async function listAdminLedgerEntries(req, res) {
     if (dateTo) {
       const e = new Date(dateTo);
       if (!Number.isNaN(e.getTime())) {
+        // si viene solo YYYY-MM-DD, lo llevamos a fin de día
         if (
           e.getHours() +
             e.getMinutes() +
@@ -96,11 +120,12 @@ export async function listAdminLedgerEntries(req, res) {
       }
     }
 
-    // filtros básicos
     if (side === "debit" || side === "credit") matchAnd.push({ side });
+
     const _accountCode = accountCode || account;
-    if (_accountCode) matchAnd.push({ accountCode: _accountCode });
-    if (currency) matchAnd.push({ currency });
+    if (_accountCode) matchAnd.push({ accountCode: String(_accountCode) });
+
+    if (currency) matchAnd.push({ currency: String(currency) });
 
     const _idCob = toInt(idCobrador);
     if (Number.isFinite(_idCob))
@@ -111,18 +136,19 @@ export async function listAdminLedgerEntries(req, res) {
       matchAnd.push({ "dimensions.idCliente": _idCli });
 
     const _min = toFloat(minAmount);
-    if (_min !== undefined) matchAnd.push({ amount: { $gte: _min } });
     const _max = toFloat(maxAmount);
-    if (_max !== undefined) {
-      const prev = matchAnd.find((m) => m.amount)?.amount || {};
-      matchAnd.push({ amount: { ...prev, $lte: _max } });
+    if (_min !== undefined || _max !== undefined) {
+      const amountFilter = {};
+      if (_min !== undefined) amountFilter.$gte = _min;
+      if (_max !== undefined) amountFilter.$lte = _max;
+      matchAnd.push({ amount: amountFilter });
     }
 
-    if (userId && isObjectIdLike(userId)) {
-      matchAnd.push({ userId: new mongoose.Types.ObjectId(userId) });
+    if (userId && isObjectIdLike(String(userId))) {
+      matchAnd.push({ userId: new mongoose.Types.ObjectId(String(userId)) });
     }
 
-    // ⛔️ Seguridad por rol del viewer
+    // ⛔️ Seguridad por rol (tu regla)
     const viewerRole = String(req.user?.role || "").trim();
     if (viewerRole === "admin") {
       matchAnd.push({
@@ -133,502 +159,224 @@ export async function listAdminLedgerEntries(req, res) {
       });
     }
 
-    const includePaymentFlag = toBool(includePayment, false);
-    const needPaymentJoin = includePaymentFlag || !!method || !!status;
-
     const baseMatch = matchAnd.length ? { $and: matchAnd } : {};
-    const _sortDir = String(sortDir).toLowerCase() === "asc" ? 1 : -1;
-    const _sortBy = SORT_ALLOWLIST.has(sortBy) ? sortBy : "postedAt";
 
+    // ───────────────────────── Search (q) ─────────────────────────
+    const qTrim = String(q || "").trim();
+    const hasQ = qTrim.length > 0;
+
+    const qNum = toInt(qTrim);
+    const isPureNumber = hasQ && Number.isFinite(qNum) && qTrim === String(qNum);
+
+    // texto => usamos regex
+    const needsTextSearch = hasQ && !isPureNumber;
+
+    // Si el user quiere buscar texto, podemos buscar:
+    // - fromUser/toUser (root)
+    // - accountCode, currency, side, kind, fromAccountCode/toAccountCode (root)
+    // - actorUserName (requiere lookup)
+    const needsActorJoinForSearch = needsTextSearch;
+
+    // Orden por actorUserName => también requiere lookup
+    const needsActorJoinForSort = _sortBy === "actorUserName";
+
+    const needActorJoin =
+      includeActorFlag || needsActorJoinForSearch || needsActorJoinForSort;
+
+    // ───────────────────────── Pipeline ─────────────────────────
     const pipeline = [];
     if (Object.keys(baseMatch).length) pipeline.push({ $match: baseMatch });
 
-    // Lookups
-    pipeline.push({
-      $lookup: {
-        from: User.collection.name,
-        localField: "userId",
-        foreignField: "_id",
-        as: "execUser",
-        pipeline: [
-          { $project: { _id: 1, name: 1, email: 1, role: 1, idCobrador: 1 } },
-        ],
-      },
-    });
-
-    pipeline.push({
-      $lookup: {
-        from: User.collection.name,
-        let: { colIdStr: { $toString: "$dimensions.idCobrador" } },
-        as: "cobradorUser",
-        pipeline: [
-          {
-            $match: {
-              $expr: {
-                $and: [
-                  { $eq: ["$role", "cobrador"] },
-                  { $eq: ["$idCobrador", "$$colIdStr"] },
-                ],
-              },
-            },
-          },
-          { $project: { _id: 1, name: 1, email: 1, idCobrador: 1 } },
-          { $limit: 1 },
-        ],
-      },
-    });
-
-    pipeline.push({
-      $lookup: {
-        from: Cliente.collection.name,
-        let: { grpId: "$dimensions.idCliente" },
-        as: "titularCliente",
-        pipeline: [
-          { $match: { $expr: { $eq: ["$idCliente", "$$grpId"] } } },
-          { $match: { rol: "TITULAR" } },
-          { $project: { _id: 1, nombre: 1, idCliente: 1 } },
-          { $limit: 1 },
-        ],
-      },
-    });
-
+    // Join payments solo si hace falta
     if (needPaymentJoin) {
+      const payPipeline = [
+        {
+          $project: {
+            _id: 1,
+            method: 1,
+            status: 1,
+            currency: 1,
+            amount: 1,
+            postedAt: 1,
+            createdAt: 1,
+          },
+        },
+      ];
+
+      if (method) payPipeline.unshift({ $match: { method: String(method) } });
+      if (status) payPipeline.unshift({ $match: { status: String(status) } });
+
       pipeline.push({
         $lookup: {
           from: Payment.collection.name,
           localField: "paymentId",
           foreignField: "_id",
           as: "payment",
-          pipeline: [
-            {
-              $project: {
-                _id: 1,
-                method: 1,
-                status: 1,
-                currency: 1,
-                amount: 1,
-                postedAt: 1,
-                createdAt: 1,
-              },
-            },
-          ],
+          pipeline: payPipeline,
         },
       });
-      const after = [];
-      if (method) after.push({ payment: { $elemMatch: { method } } });
-      if (status) after.push({ payment: { $elemMatch: { status } } });
-      if (after.length) pipeline.push({ $match: { $and: after } });
+
+      // Si filtro por method/status, me quedo solo con los que matchearon
+      if (method || status) {
+        pipeline.push({
+          $match: { $expr: { $gt: [{ $size: "$payment" }, 0] } },
+        });
+      }
     }
 
-    // Nombres base + flags
-    pipeline.push({
-      $addFields: {
-        _adminName: { $ifNull: [{ $first: "$execUser.name" }, "CAJA_ADMIN"] },
-        _cobradorName: {
-          $ifNull: [
-            { $first: "$cobradorUser.name" },
-            {
-              $cond: [
-                {
-                  $or: [
-                    {
-                      $in: [
-                        { $type: "$dimensions.idCobrador" },
-                        ["missing", "null"],
-                      ],
-                    },
-                    { $eq: ["$dimensions.idCobrador", 0] }, // idCobrador = 0 => sin cobrador
-                  ],
-                },
-                null,
-                {
-                  $concat: [
-                    "Cobrador #",
-                    { $toString: "$dimensions.idCobrador" },
-                  ],
-                },
-              ],
-            },
-          ],
+    // Actor join (solo si hace falta)
+    if (needActorJoin) {
+      pipeline.push(
+        {
+          $lookup: {
+            from: User.collection.name,
+            localField: "userId",
+            foreignField: "_id",
+            as: "actorUser",
+            pipeline: [
+              { $project: { _id: 1, name: 1, email: 1, role: 1, idCobrador: 1 } },
+            ],
+          },
         },
-
-        _clienteName: {
-          $ifNull: [
-            { $first: "$titularCliente.nombre" },
-            {
-              $cond: [
-                {
-                  $in: [
-                    { $type: "$dimensions.idCliente" },
-                    ["missing", "null"],
-                  ],
-                },
-                null,
-                {
-                  $concat: [
-                    "Cliente #",
-                    { $toString: "$dimensions.idCliente" },
-                  ],
-                },
-              ],
-            },
-          ],
-        },
-        _hasCliente: {
-          $cond: [
-            { $in: [{ $type: "$dimensions.idCliente" }, ["missing", "null"]] },
-            false,
-            true,
-          ],
-        },
-      },
-    });
-
-    // Reglas FROM/TO
-    const G_CHICA = "CAJA_CHICA (GLOBAL)";
-    const G_GRANDE = "CAJA_GRANDE (GLOBAL)";
-    const G_SUPERADMIN = "CAJA_SUPERADMIN";
-
-    pipeline.push({
-      $addFields: {
-        fromUserName: {
-          $switch: {
-            branches: [
-              {
-                case: {
-                  $and: [
-                    { $eq: ["$accountCode", "CAJA_ADMIN"] },
-                    { $eq: ["$side", "credit"] },
-                  ],
-                },
-                then: G_CHICA,
-              },
-              {
-                case: {
-                  $and: [
-                    { $eq: ["$accountCode", "CAJA_CHICA"] },
-                    { $eq: ["$side", "debit"] },
-                  ],
-                },
-                then: { $ifNull: ["$_adminName", "CAJA_ADMIN"] },
-              },
-              {
-                case: {
-                  $and: [
-                    { $eq: ["$accountCode", "CAJA_CHICA"] },
-                    { $eq: ["$side", "credit"] },
-                  ],
-                },
-                then: G_GRANDE,
-              },
-              {
-                case: {
-                  $and: [
-                    { $eq: ["$accountCode", "CAJA_GRANDE"] },
-                    { $eq: ["$side", "debit"] },
-                  ],
-                },
-                then: G_CHICA,
-              },
-              {
-                case: {
-                  $and: [
-                    { $eq: ["$accountCode", "CAJA_GRANDE"] },
-                    { $eq: ["$side", "credit"] },
-                  ],
-                },
-                then: G_SUPERADMIN,
-              },
-              {
-                case: {
-                  $and: [
-                    { $eq: ["$accountCode", "CAJA_SUPERADMIN"] },
-                    { $eq: ["$side", "debit"] },
-                  ],
-                },
-                then: G_GRANDE,
-              },
-              {
-                case: {
-                  $and: [
-                    { $eq: ["$accountCode", "CAJA_COBRADOR"] },
-                    { $eq: ["$side", "credit"] },
-                  ],
-                },
-                then: { $ifNull: ["$_adminName", "CAJA_ADMIN"] },
-              },
-              {
-                case: {
-                  $and: [
-                    { $eq: ["$accountCode", "INGRESOS_CUOTAS"] },
-                    { $eq: ["$side", "credit"] },
-                  ],
-                },
-                then: { $ifNull: ["$_cobradorName", "$_adminName"] },
-              },
-              {
-                case: {
-                  $and: [
-                    { $eq: ["$accountCode", "CAJA_ADMIN"] },
-                    { $eq: ["$side", "debit"] },
-                  ],
-                },
-                // 👇 Débito de CAJA_ADMIN: del cliente → usuario (fallback cobrador/admin)
-                then: {
+        {
+          $addFields: {
+            actorUserName: {
+              $let: {
+                vars: { u: { $first: "$actorUser" } },
+                in: {
                   $ifNull: [
-                    "$_clienteName",
-                    {
-                      $ifNull: ["$_cobradorName", "$_adminName"],
-                    },
+                    { $ifNull: ["$$u.name", "$$u.email"] },
+                    null,
                   ],
                 },
               },
-              {
-                case: {
-                  $and: [
-                    { $eq: ["$accountCode", "CAJA_COBRADOR"] },
-                    { $eq: ["$side", "debit"] },
-                    { $eq: ["$_hasCliente", false] },
-                  ],
-                },
-                then: { $ifNull: ["$_adminName", "CAJA_ADMIN"] },
-              },
-              {
-                case: {
-                  $and: [
-                    { $eq: ["$accountCode", "CAJA_COBRADOR"] },
-                    { $eq: ["$side", "debit"] },
-                    { $eq: ["$_hasCliente", true] },
-                  ],
-                },
-                then: { $ifNull: ["$_clienteName", "CLIENTE"] },
-              },
-            ],
-            default: {
-              $cond: [
-                { $eq: ["$side", "debit"] },
-                { $ifNull: ["$_adminName", "$_cobradorName"] },
-                { $ifNull: ["$_cobradorName", "$_adminName"] },
-              ],
             },
           },
-        },
-        toUserName: {
-          $switch: {
-            branches: [
-              {
-                case: {
-                  $and: [
-                    { $eq: ["$accountCode", "CAJA_ADMIN"] },
-                    { $eq: ["$side", "credit"] },
-                  ],
-                },
-                then: { $ifNull: ["$_adminName", "CAJA_ADMIN"] },
-              },
-              {
-                case: {
-                  $and: [
-                    { $eq: ["$accountCode", "CAJA_CHICA"] },
-                    { $eq: ["$side", "debit"] },
-                  ],
-                },
-                then: G_CHICA,
-              },
-              {
-                case: {
-                  $and: [
-                    { $eq: ["$accountCode", "CAJA_CHICA"] },
-                    { $eq: ["$side", "credit"] },
-                  ],
-                },
-                then: G_CHICA,
-              },
-              {
-                case: {
-                  $and: [
-                    { $eq: ["$accountCode", "CAJA_GRANDE"] },
-                    { $eq: ["$side", "debit"] },
-                  ],
-                },
-                then: G_GRANDE,
-              },
-              {
-                case: {
-                  $and: [
-                    { $eq: ["$accountCode", "CAJA_GRANDE"] },
-                    { $eq: ["$side", "credit"] },
-                  ],
-                },
-                then: G_GRANDE,
-              },
-              {
-                case: {
-                  $and: [
-                    { $eq: ["$accountCode", "CAJA_SUPERADMIN"] },
-                    { $eq: ["$side", "debit"] },
-                  ],
-                },
-                then: { $ifNull: ["$_adminName", G_SUPERADMIN] },
-              },
-              {
-                case: {
-                  $and: [
-                    { $eq: ["$accountCode", "CAJA_COBRADOR"] },
-                    { $eq: ["$side", "credit"] },
-                  ],
-                },
-                then: { $ifNull: ["$_cobradorName", "COBRADOR"] },
-              },
-              {
-                case: {
-                  $and: [
-                    { $eq: ["$accountCode", "INGRESOS_CUOTAS"] },
-                    { $eq: ["$side", "credit"] },
-                  ],
-                },
-                then: { $ifNull: ["$_clienteName", "$_adminName"] },
-              },
-              {
-                case: {
-                  $and: [
-                    { $eq: ["$accountCode", "CAJA_ADMIN"] },
-                    { $eq: ["$side", "debit"] },
-                  ],
-                },
-                // 👇 acá vuelve a ser simplemente la caja/admin (entra a la caja del usuario)
-                then: { $ifNull: ["$_adminName", "CAJA_ADMIN"] },
-              },
-              {
-                case: {
-                  $and: [
-                    { $eq: ["$accountCode", "CAJA_COBRADOR"] },
-                    { $eq: ["$side", "debit"] },
-                    { $eq: ["$_hasCliente", false] },
-                  ],
-                },
-                then: { $ifNull: ["$_cobradorName", "COBRADOR"] },
-              },
-              {
-                case: {
-                  $and: [
-                    { $eq: ["$accountCode", "CAJA_COBRADOR"] },
-                    { $eq: ["$side", "debit"] },
-                    { $eq: ["$_hasCliente", true] },
-                  ],
-                },
-                then: { $ifNull: ["$_cobradorName", "COBRADOR"] },
-              },
-            ],
-            default: {
-              $cond: [
-                { $eq: ["$side", "debit"] },
-                { $ifNull: ["$_cobradorName", "$_adminName"] },
-                { $ifNull: ["$_adminName", "$_cobradorName"] },
-              ],
-            },
-          },
-        },
-      },
-    });
-
-    // Búsqueda extendida
-    if (q && q.trim()) {
-      const re = new RegExp(
-        q.trim().replace(/[.*+?^${}()|[\]\\]/g, "\\$&"),
-        "i"
+        }
       );
+    }
+
+    // q numérico => match directo sin lookups extra
+    if (isPureNumber) {
       pipeline.push({
         $match: {
           $or: [
-            { accountCode: re },
-            { currency: re },
-            { side: re },
-            { fromUserName: re },
-            { toUserName: re },
-            { "dimensions.idCliente": toInt(q) || -999999 },
-            { "dimensions.idCobrador": toInt(q) || -999999 },
+            { "dimensions.idCliente": qNum },
+            { "dimensions.idCobrador": qNum },
+            { amount: qNum },
           ],
         },
       });
     }
 
-    // Proyección final
+    // q texto => match por root strings + actorUserName (si existe)
+    if (needsTextSearch) {
+      const re = new RegExp(escapeRegex(qTrim), "i");
+      const or = [
+        { accountCode: re },
+        { currency: re },
+        { side: re },
+        { kind: re },
+        { fromAccountCode: re },
+        { toAccountCode: re },
+        { fromUser: re },
+        { toUser: re },
+      ];
+      if (needActorJoin) or.push({ actorUserName: re });
+
+      pipeline.push({ $match: { $or: or } });
+    }
+
+    // ───────────────────────── Facet (items/total/stats) ─────────────────────────
+    // OJO: si ordenás por actorUserName y no hicimos lookup, no se puede.
+    // Ya lo forzamos con needActorJoinForSort.
+    const facet = {
+      items: [
+        { $sort: { [_sortBy]: _sortDir, _id: -1 } },
+        { $skip: _skip },
+        { $limit: _limit },
+      ],
+      total: [{ $count: "total" }],
+      statsByCurrency: [
+        {
+          $group: {
+            _id: "$currency",
+            lines: { $sum: 1 },
+            debit: debitExpr,
+            credit: creditExpr,
+          },
+        },
+        {
+          $project: {
+            _id: 0,
+            currency: "$_id",
+            lines: 1,
+            debit: 1,
+            credit: 1,
+            net: { $subtract: ["$credit", "$debit"] },
+          },
+        },
+        { $sort: { currency: 1 } },
+      ],
+    };
+
+    // Proyección final (solo NUEVO esquema)
     const finalProject = {
       _id: 1,
       paymentId: 1,
       kind: 1,
+
+      // ✅ owner/actor del asiento
+      userId: 1,
+
+      // ✅ root strings
+      fromUser: 1,
+      toUser: 1,
+
+      // ✅ cuentas lógicas root
+      fromAccountCode: 1,
+      toAccountCode: 1,
+
       side: 1,
       accountCode: 1,
       amount: 1,
       currency: 1,
       postedAt: 1,
       createdAt: 1,
+
       dimensions: 1,
-      fromUserName: 1,
-      toUserName: 1,
     };
+
+    if (needActorJoin) {
+      finalProject.actorUserName = 1;
+      finalProject.actorUser = includeActorFlag
+        ? { $cond: [{ $gt: [{ $size: "$actorUser" }, 0] }, { $first: "$actorUser" }, null] }
+        : undefined;
+      // si no querés devolver el objeto actorUser nunca, borrá la línea de arriba.
+      delete finalProject.actorUser; // <- por defecto NO devolvemos el doc entero
+    }
+
     if (needPaymentJoin) {
       if (includePaymentFlag) {
         finalProject.payment = {
-          $cond: [
-            { $gt: [{ $size: "$payment" }, 0] },
-            { $first: "$payment" },
-            null,
-          ],
+          $cond: [{ $gt: [{ $size: "$payment" }, 0] }, { $first: "$payment" }, null],
         };
       } else {
-        finalProject["payment.method"] = {
-          $ifNull: [{ $first: "$payment.method" }, null],
-        };
-        finalProject["payment.status"] = {
-          $ifNull: [{ $first: "$payment.status" }, null],
-        };
+        finalProject["payment.method"] = { $ifNull: [{ $first: "$payment.method" }, null] };
+        finalProject["payment.status"] = { $ifNull: [{ $first: "$payment.status" }, null] };
       }
     }
-    pipeline.push({ $project: finalProject });
 
-    // Ejecutar
-    const itemsPipeline = [
-      ...pipeline,
-      { $sort: { [_sortBy]: _sortDir, _id: -1 } },
-      { $skip: _skip },
-      { $limit: _limit },
-    ];
-    const countPipeline = [...pipeline, { $count: "total" }];
-    const statsPipeline = [
-      ...pipeline,
-      {
-        $group: {
-          _id: "$currency",
-          lines: { $sum: 1 },
-          debit: {
-            $sum: { $cond: [{ $eq: ["$side", "debit"] }, "$amount", 0] },
-          },
-          credit: {
-            $sum: { $cond: [{ $eq: ["$side", "credit"] }, "$amount", 0] },
-          },
-        },
-      },
-      {
-        $project: {
-          _id: 0,
-          currency: "$_id",
-          lines: 1,
-          debit: 1,
-          credit: 1,
-          net: { $subtract: ["$credit", "$debit"] },
-        },
-      },
-      { $sort: { currency: 1 } },
-    ];
+    facet.items.push({ $project: finalProject });
 
-    const [items, totalArr, statsArr] = await Promise.all([
-      LedgerEntry.aggregate(itemsPipeline),
-      LedgerEntry.aggregate(countPipeline),
-      LedgerEntry.aggregate(statsPipeline),
-    ]);
+    pipeline.push({ $facet: facet });
 
-    const total = totalArr?.[0]?.total || 0;
+    const [out] = await LedgerEntry.aggregate(pipeline).allowDiskUse(true);
+
+    const items = out?.items || [];
+    const total = out?.total?.[0]?.total || 0;
+    const statsArr = out?.statsByCurrency || [];
+
     const stats = {};
     for (const s of statsArr) {
       stats[s.currency || "-"] = {
@@ -639,7 +387,7 @@ export async function listAdminLedgerEntries(req, res) {
       };
     }
 
-    res.json({
+    return res.json({
       ok: true,
       page: _page,
       pageSize: _limit,
@@ -650,11 +398,10 @@ export async function listAdminLedgerEntries(req, res) {
     });
   } catch (err) {
     console.error("listAdminLedgerEntries error:", err);
-    res.status(500).json({
+    return res.status(500).json({
       ok: false,
       message: "Error al listar el libro mayor.",
       error: err?.message,
     });
   }
 }
-

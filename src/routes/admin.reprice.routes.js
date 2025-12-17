@@ -1,10 +1,13 @@
 // src/routes/admin.reprice.routes.js
 import { Router } from "express";
 import {
-  recomputeGroupPricing,
-  recomputeAllGroups,
-  recomputeGroupsByIds,
-} from "../services/pricing.services.js";
+  repriceGroupController,
+  repriceAllGroupsController,
+  repriceByIdsController,
+  increasePercentController,
+  repriceProgressController,
+} from "../controllers/admin.reprice.controller.js";
+
 
 // Helpers simples (iguales a settings.routes)
 function requireAuth(req, res, next) {
@@ -14,7 +17,9 @@ function requireAuth(req, res, next) {
 function requireSuperAdmin(req, res, next) {
   const role = req?.session?.user?.role || req?.user?.role;
   if (role === "superAdmin") return next();
-  return res.status(403).json({ ok: false, message: "Requiere rol superAdmin" });
+  return res
+    .status(403)
+    .json({ ok: false, message: "Requiere rol superAdmin" });
 }
 
 const router = Router();
@@ -27,19 +32,7 @@ router.post(
   "/reprice/:idCliente",
   requireAuth,
   requireSuperAdmin,
-  async (req, res) => {
-    try {
-      const { idCliente } = req.params;
-      if (!idCliente?.toString().trim()) {
-        return res.status(400).json({ ok: false, message: "idCliente requerido" });
-      }
-      const r = await recomputeGroupPricing(idCliente, { debug: false });
-      res.json({ ok: true, ...r });
-    } catch (err) {
-      const status = err?.status || 500;
-      res.status(status).json({ ok: false, message: err?.message || "Error reprice grupo" });
-    }
-  }
+  repriceGroupController
 );
 
 /**
@@ -51,20 +44,14 @@ router.post(
   "/reprice-all",
   requireAuth,
   requireSuperAdmin,
-  async (req, res) => {
-    try {
-      const { concurrency, logEvery } = req.body || {};
-      const r = await recomputeAllGroups({
-        concurrency: Number.isFinite(Number(concurrency)) ? Number(concurrency) : undefined,
-        logEvery: Number.isFinite(Number(logEvery)) ? Number(logEvery) : undefined,
-        debug: false,
-      });
-      res.json({ ok: true, ...r });
-    } catch (err) {
-      const status = err?.status || 500;
-      res.status(status).json({ ok: false, message: err?.message || "Error reprice-all" });
-    }
-  }
+  repriceAllGroupsController
+);
+
+router.get(
+  "/reprice-progress",
+  requireAuth,
+  requireSuperAdmin,
+  repriceProgressController
 );
 
 /**
@@ -76,23 +63,24 @@ router.post(
   "/reprice-by-ids",
   requireAuth,
   requireSuperAdmin,
-  async (req, res) => {
-    try {
-      const { ids, concurrency, logEvery } = req.body || {};
-      if (!Array.isArray(ids) || ids.length === 0) {
-        return res.status(400).json({ ok: false, message: "Se requiere 'ids' (array no vacío)" });
-      }
-      const r = await recomputeGroupsByIds(ids, {
-        concurrency: Number.isFinite(Number(concurrency)) ? Number(concurrency) : undefined,
-        logEvery: Number.isFinite(Number(logEvery)) ? Number(logEvery) : undefined,
-        debug: false,
-      });
-      res.json({ ok: true, ...r });
-    } catch (err) {
-      const status = err?.status || 500;
-      res.status(status).json({ ok: false, message: err?.message || "Error reprice-by-ids" });
-    }
-  }
+  repriceByIdsController
+);
+
+/**
+ * POST /api/admin/increase-percent
+ * Aumenta precios por porcentaje.
+ * Body:
+ * {
+ *   percent: number,
+ *   applyToIdeal: boolean,
+ *   applyToHistorical: boolean,
+ * }
+ */
+router.post(
+  "/increase-percent",
+  requireAuth,
+  requireSuperAdmin,
+  increasePercentController
 );
 
 export default router;

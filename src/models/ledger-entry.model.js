@@ -1,14 +1,6 @@
 // src/models/ledgerEntry.model.js
 import mongoose from "mongoose";
 
-/**
- * Doble partida mínima:
- *  - Cada Payment 'posted' genera al menos 2 líneas:
- *    * DEBIT  CAJA_COBRADOR (o A_RENDIR_COBRADOR)
- *    * CREDIT INGRESOS_CUOTAS (o CUENTAS_A_COBRAR si manejás devengado)
- *  - Reversals generan líneas invertidas.
- */
-
 const SIDES = ["debit", "credit"];
 
 const LedgerEntrySchema = new mongoose.Schema(
@@ -20,7 +12,7 @@ const LedgerEntrySchema = new mongoose.Schema(
       index: true,
     },
 
-    // 👇 NUEVO: quién ejecutó el asiento (retiro, cobro, etc.)
+    // quién ejecutó/creó el asiento (actor del evento)
     userId: {
       type: mongoose.Schema.Types.ObjectId,
       ref: "userMemorial",
@@ -28,28 +20,43 @@ const LedgerEntrySchema = new mongoose.Schema(
       index: true,
     },
 
+    // ✅ NUEVO (como vos querés): texto, no ObjectId
+    fromUser: {
+      type: String, // ← nombre (cliente o usuario)
+      default: null,
+      index: true,
+    },
+    toUser: {
+      type: String, // ← nombre (cliente o usuario)
+      default: null,
+      index: true,
+    },
+
+    // ✅ (opcional pero MUY útil) de dónde → hacia dónde (cuentas lógicas)
+    fromAccountCode: { type: String, default: null, index: true },
+    toAccountCode: { type: String, default: null, index: true },
+
+    // Tipo lógico del movimiento (ej: "payment", "commission_payout", "transfer", "ARQUEO_MANUAL")
+    kind: { type: String, index: true },
+
     side: { type: String, enum: SIDES, required: true },
-    accountCode: { type: String, required: true, index: true }, // ej: CAJA_COBRADOR, INGRESOS_CUOTAS
+    accountCode: { type: String, required: true, index: true },
     amount: { type: Number, required: true, min: 0 },
     currency: { type: String, default: "ARS" },
     postedAt: { type: Date, default: () => new Date(), index: true },
 
-    // Dimensiones analíticas
+    // Dimensiones analíticas / operativas
+    // ✅ IMPORTANTE: declararlas para que NO se pierdan
     dimensions: {
-      idCobrador: { type: Number, index: true },
-      idCliente: { type: Number, index: true },
-      plan: { type: String },
-      canal: { type: String },
-      // agrega lo que necesites para BI (zona, sucursal, etc.)
+      // analytics
+      idCobrador: { type: Number, index: true, default: null },
+      idCliente: { type: Number, index: true, default: null },
+      plan: { type: String, default: null },
+      canal: { type: String, default: null },
+      note: { type: String, default: "" },
     },
   },
   { timestamps: true, versionKey: false }
 );
-
-// Índices útiles
-LedgerEntrySchema.index({ accountCode: 1, postedAt: -1 });
-LedgerEntrySchema.index({ userId: 1, postedAt: -1 });
-LedgerEntrySchema.index({ userId: 1, currency: 1, postedAt: -1 });
-LedgerEntrySchema.index({ "dimensions.idCobrador": 1, postedAt: -1 });
 
 export default mongoose.model("ledgerentries", LedgerEntrySchema);

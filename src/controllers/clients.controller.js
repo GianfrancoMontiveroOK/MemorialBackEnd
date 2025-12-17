@@ -1,4 +1,4 @@
-// src/controllers/clientes.controller.js  (ESM)
+ // src/controllers/clientes.controller.js  (ESM)
 
 import mongoose from "mongoose";
 import Cliente from "../models/client.model.js";
@@ -1665,14 +1665,14 @@ export async function getClientesStats(req, res, next) {
         .status(400)
         .json({ ok: false, message: "Falta o es inválido ?period=YYYY-MM" });
     }
-    const { start: periodStartUTC, end: periodEndUTC } = bounds;
+    const { start: periodStartUTC, end: periodEndUTC } = bounds; // (no usado pero lo dejamos por si extiendes aging V2)
 
     // Ventana general para "pagos recientes" y ledger snapshot por default (últimos 30 días)
     const defaultFrom = new Date(now.getTime() - 30 * 86400000);
     const df = parseISODate(dateFrom, defaultFrom);
     const dt = parseISODate(dateTo, now);
 
-    // Filtros comunes
+    // Filtros comunes para pagos
     const paymentMatch = {
       currency,
       status: { $in: ["posted", "settled"] },
@@ -1683,18 +1683,25 @@ export async function getClientesStats(req, res, next) {
     };
 
     // ===== 1) BASE: “debido” del período por GRUPO =====
-    // Clientes activos en el período (no dados de baja antes del inicio).
-    // cuotaEfectiva = usarCuotaIdeal ? cuotaIdeal : cuota
-    // DebidoGrupoPeriodo = SUM(cuotaEfectiva de todos los miembros activos del grupo)
+    // Regla:
+    // - Ignorar miembros con baja=true
+    // - Pero NO perder el grupo si hay al menos UN miembro activo.
+    // - cuotaEfectiva = usarCuotaIdeal ? cuotaIdeal : cuota, sólo para miembros activos.
     const debidoPorGrupo = await Cliente.aggregate([
       {
-        $match: {
-          activo: true,
-          $or: [{ baja: null }, { baja: { $gte: periodStartUTC } }],
-        },
-      },
-      {
         $addFields: {
+          isActivoPeriodo: {
+            $and: [
+              { $eq: ["$activo", true] },
+              {
+                $or: [
+                  { $eq: [{ $type: "$baja" }, "missing"] },
+                  { $eq: ["$baja", null] },
+                  { $eq: ["$baja", false] },
+                ],
+              },
+            ],
+          },
           cuotaEfectiva: {
             $cond: [
               { $eq: ["$usarCuotaIdeal", true] },
@@ -1706,12 +1713,37 @@ export async function getClientesStats(req, res, next) {
       },
       {
         $group: {
-          _id: "$idCliente", // grupo
+          _id: "$idCliente",
           idCliente: { $first: "$idCliente" },
           nombreTitular: { $first: "$nombreTitular" },
-          miembros: { $sum: 1 },
-          debido: { $sum: "$cuotaEfectiva" },
+          miembrosActivos: {
+            $sum: {
+              $cond: ["$isActivoPeriodo", 1, 0],
+            },
+          },
+          debido: {
+            $sum: {
+              $cond: ["$isActivoPeriodo", "$cuotaEfectiva", 0],
+            },
+          },
           idCobrador: { $first: "$idCobrador" },
+        },
+      },
+      {
+        // si TODOS están de baja/inactivos, miembrosActivos = 0 → se filtra el grupo
+        $match: {
+          idCliente: { $ne: null },
+          miembrosActivos: { $gt: 0 },
+        },
+      },
+      {
+        $project: {
+          _id: 0,
+          idCliente: 1,
+          nombreTitular: 1,
+          miembros: "$miembrosActivos",
+          debido: 1,
+          idCobrador: 1,
         },
       },
     ]);
@@ -1725,7 +1757,6 @@ export async function getClientesStats(req, res, next) {
     }
 
     // ===== 2) COBERTURA DEL PERÍODO (pagado aplicado a allocations.period === period) =====
-    // Sumamos amountApplied por grupo para allocations del período
     const pagadoPeriodo = await Payment.aggregate([
       {
         $match: {
@@ -1744,7 +1775,6 @@ export async function getClientesStats(req, res, next) {
           _id: "$cliente.idCliente",
           idCliente: { $first: "$cliente.idCliente" },
           pagado: { $sum: "$allocations.amountApplied" },
-          // para mix por cobrador
           idCobrador: { $first: "$collector.idCobrador" },
         },
       },
@@ -1790,7 +1820,6 @@ export async function getClientesStats(req, res, next) {
       else negative.push(item);
     }
 
-    // Ordenar top lists
     const topPositive = [...positive]
       .sort((a, b) => b.gap - a.gap)
       .slice(0, 15);
@@ -1798,9 +1827,8 @@ export async function getClientesStats(req, res, next) {
       .sort((a, b) => a.gap - b.gap)
       .slice(0, 15);
 
-    // ===== 4) BY COBRADOR: agregados (cobertura, due, paid, mix, tickets) =====
-    // Reutilizamos coverage para KPIs rápidos y completamos con mix desde payments
-    const byCobradorBase = new Map(); // idCobrador -> { due, paid, grupos, paidCount, partialCount, unpaidCount }
+    // ===== 4) BY COBRADOR =====
+    const byCobradorBase = new Map();
     for (const g of coverage) {
       if (g.idCobrador == null) continue;
       const acc = byCobradorBase.get(g.idCobrador) || {
@@ -1821,7 +1849,6 @@ export async function getClientesStats(req, res, next) {
       byCobradorBase.set(g.idCobrador, acc);
     }
 
-    // Mix de método/canal y tickets por cobrador (sobre ventana df..dt)
     const pagosVentana = await Payment.aggregate([
       { $match: paymentMatch },
       {
@@ -1837,9 +1864,7 @@ export async function getClientesStats(req, res, next) {
       },
     ]);
 
-    // Distribuciones por cobrador
-    const cobradorMix = new Map(); // idCobrador -> { methods: {..}, channels: {..}, tickets: {avg,median,count,sum} }
-    // Necesitamos también tickets por cobrador para promedio/mediana
+    const cobradorMix = new Map();
     const tickets = await Payment.aggregate([
       { $match: paymentMatch },
       {
@@ -1888,7 +1913,6 @@ export async function getClientesStats(req, res, next) {
       cobradorMix.set(idCob, row);
     }
 
-    // Completar “byCobrador”
     const byCobrador = [];
     for (const [idCob, base] of byCobradorBase.entries()) {
       const mix = cobradorMix.get(idCob) || {
@@ -1916,22 +1940,17 @@ export async function getClientesStats(req, res, next) {
         },
       });
     }
-    // Ordenar por cobertura y luego por paid
     byCobrador.sort(
       (a, b) => b.coverageRate - a.coverageRate || b.paid - a.paid
     );
 
-    // ===== 5) AGING de deuda por grupo (gap negativo convertido en “deuda” del período) =====
-    // Nota: Aging real multi-período requeriría allocations históricos; acá hacemos un aging “rápido”
-    // sobre el gap del período. Si querés aging multi-mes, armamos V2 con proyección de períodos abiertos.
+    // ===== 5) AGING rápido =====
     function bucketizeGap(gapValue) {
-      // Solo medimos deuda del período actual: si gap < 0 → deuda actual (0-30)
-      // (V2: extender con saldos de períodos anteriores)
       if (gapValue >= 0) return null;
       return "0-30";
     }
 
-    const agingBuckets = { "0-30": 0, "31-60": 0, "61-90": 0, "90+": 0 }; // placeholders V2
+    const agingBuckets = { "0-30": 0, "31-60": 0, "61-90": 0, "90+": 0 };
     let gruposConDeuda = 0;
     for (const g of coverage) {
       const b = bucketizeGap(g.gap);
@@ -1941,7 +1960,7 @@ export async function getClientesStats(req, res, next) {
       }
     }
 
-    // ===== 6) MIX general (método/canal) y tickets globales en ventana df..dt =====
+    // ===== 6) MIX general y tickets globales =====
     const mixGeneral = await Payment.aggregate([
       { $match: paymentMatch },
       {
@@ -2003,7 +2022,7 @@ export async function getClientesStats(req, res, next) {
       { $sort: { _id: 1 } },
     ]);
 
-    // ===== 8) USERS (opcional: mapa idCobrador -> nombre) =====
+    // ===== 8) USERS → nombres de cobradores =====
     const cobradoresUsers = await User.find({ idCobrador: { $ne: null } })
       .select({ name: 1, idCobrador: 1 })
       .lean();
@@ -2014,16 +2033,20 @@ export async function getClientesStats(req, res, next) {
         cobradorNameMap.set(Number(u.idCobrador), u.name);
     }
 
-    // Enriquecer byCobrador con nombres
     for (const row of byCobrador) {
       row.cobradorNombre = cobradorNameMap.get(Number(row.idCobrador)) || null;
     }
 
     // ===== 9) SUMMARY general =====
     const totalGrupos = debidoPorGrupo.length;
+
     const totalMiembros = await Cliente.countDocuments({
       activo: true,
-      $or: [{ baja: null }, { baja: { $gte: periodStartUTC } }],
+      $or: [
+        { baja: { $exists: false } },
+        { baja: null },
+        { baja: false },
+      ],
     });
 
     const fullyPaid = coverage.filter((c) => c.status === "paid").length;
@@ -2035,7 +2058,6 @@ export async function getClientesStats(req, res, next) {
         ? Number((totalPagadoPeriodo / totalDebido).toFixed(4))
         : 0;
 
-    // Mix general formateado
     const mix = { methods: {}, channels: {} };
     for (const row of mixGeneral) {
       const m = row._id.method || "otro";
@@ -2054,36 +2076,27 @@ export async function getClientesStats(req, res, next) {
           totalMiembros,
           totalDebido: Number(totalDebido.toFixed(2)),
           totalPagadoPeriodo: Number(totalPagadoPeriodo.toFixed(2)),
-          coverageRate: coverageRateGlobal, // pagado/debido
+          coverageRate: coverageRateGlobal,
           grupos: { paid: fullyPaid, partial: partially, unpaid },
           ticketsGlobal,
           mix,
         },
-
-        // Cobertura por grupo (para tablas o drilldowns)
-        coverage, // [{ idCliente, due, paid, gap, status, ... }]
-
-        // Ranking por cobrador (mezcla due/pagado/mix/tickets)
+        coverage,
         byCobrador,
-
-        // Aging rápido del período (V2: extender a multi-período)
         aging: {
           buckets: agingBuckets,
           gruposConDeuda,
         },
-
-        // Top 15 mejores y peores gaps
         topPositive,
         topNegative,
-
-        // Ledger último tramo (caja/ingresos, etc.)
         ledgerSnapshot,
       },
       meta: {
         generatedAt: new Date().toISOString(),
         currency,
         notes: [
-          "El debido del período por grupo = suma de cuotas efectivas (usarCuotaIdeal? cuotaIdeal : cuota) de los miembros activos.",
+          "El debido del período por grupo usa solo integrantes activos (activo=true y baja!=true).",
+          "Si todos los integrantes de un grupo están dados de baja, el grupo no aparece en coverage.",
           "La cobertura del período usa Payment.allocations filtradas por allocations.period === period.",
           "El aging que ves es del período actual (0-30). Para aging multi-mes armamos V2 con saldos acumulados.",
         ],

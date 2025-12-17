@@ -16,7 +16,21 @@ import {
 } from "./payments.shared.js";
 
 const { Types } = mongoose;
+const normalizeDateStart = (v) => {
+  if (!v) return null;
+  const d = new Date(v);
+  if (Number.isNaN(d.getTime())) return null;
+  d.setHours(0, 0, 0, 0);
+  return d;
+};
 
+const normalizeDateEnd = (v) => {
+  if (!v) return null;
+  const d = new Date(v);
+  if (Number.isNaN(d.getTime())) return null;
+  d.setHours(23, 59, 59, 999);
+  return d;
+};
 /* ============ GET /collector/clientes ============ */
 export async function listCollectorClients(req, res, next) {
   try {
@@ -404,10 +418,12 @@ export async function getCollectorClientDebt(req, res, next) {
         .status(400)
         .json({ ok: false, message: "Falta idCobrador en la sesión." });
     }
+    const myCollectorIdStr = String(myCollectorId);
 
     const id = String(req.params.id || "").trim();
-    if (!isObjectId(id))
+    if (!isObjectId(id)) {
       return res.status(400).json({ ok: false, message: "ID inválido" });
+    }
 
     const member = await Cliente.findById(id)
       .select(
@@ -415,14 +431,19 @@ export async function getCollectorClientDebt(req, res, next) {
       )
       .lean();
 
-    if (!member)
+    if (!member) {
       return res
         .status(404)
         .json({ ok: false, message: "Cliente no encontrado" });
-    if (Number(member.idCobrador) !== myCollectorId)
+    }
+
+    // ✅ cartera robusta (idCobrador puede ser number o string)
+    const memberCidStr = member?.idCobrador != null ? String(member.idCobrador) : "";
+    if (memberCidStr !== myCollectorIdStr) {
       return res
         .status(403)
         .json({ ok: false, message: "El cliente no pertenece a tu cartera." });
+    }
 
     const { from, to, includeFuture } = req.query || {};
     const base = await getClientPeriodState(member, {
@@ -437,9 +458,17 @@ export async function getCollectorClientDebt(req, res, next) {
     const cuotaVigente =
       Number(member.usarCuotaIdeal ? member.cuotaIdeal : member.cuota) || 0;
 
-    // Suma ya imputada al período actual
+    // ✅ Suma ya imputada al período actual (solo pagos válidos)
     const paidNowAgg = await Payment.aggregate([
-      { $match: { "cliente.memberId": new Types.ObjectId(member._id) } },
+      {
+        $match: {
+          status: { $in: ["posted", "settled"] },
+          // memberId robusto (ObjectId/string)
+          $expr: {
+            $eq: [{ $toString: "$cliente.memberId" }, String(member._id)],
+          },
+        },
+      },
       { $unwind: "$allocations" },
       { $match: { "allocations.period": nowPeriod } },
       {
@@ -453,6 +482,7 @@ export async function getCollectorClientDebt(req, res, next) {
         },
       },
     ]).allowDiskUse(true);
+
     const alreadyAppliedNow = Number(paidNowAgg?.[0]?.sum || 0);
 
     // Ajustar/inyectar período actual
@@ -509,6 +539,7 @@ export async function getCollectorClientDebt(req, res, next) {
   }
 }
 
+
 export async function getCollectorSummary(req, res, next) {
   try {
     const myCollectorId = Number(req.user?.idCobrador);
@@ -517,37 +548,64 @@ export async function getCollectorSummary(req, res, next) {
         .status(400)
         .json({ ok: false, message: "Falta idCobrador en la sesión." });
     }
+    const myCollectorIdStr = String(myCollectorId);
 
-    /* ────────────────────── Fecha / período actual ────────────────────── */
-
+    // ─────────────────────── Rango de fechas / período ───────────────────────
     const now = new Date();
-    const year = now.getFullYear();
-    const month = now.getMonth(); // 0–11
-    const period = yyyymmAR(now); // "YYYY-MM"
 
-    const monthStart = new Date(year, month, 1, 0, 0, 0, 0);
-    const monthEnd = new Date(year, month + 1, 0, 23, 59, 59, 999);
+    // Si en tu proyecto existen normalizeDateStart/End como en admin, los usamos:
+    let rangeStart = normalizeDateStart(req.query?.dateFrom);
+    let rangeEnd = normalizeDateEnd(req.query?.dateTo);
+
+    // Si no mandan rango, usamos el mes actual completo
+    if (!rangeStart || !rangeEnd) {
+      const yearNow = now.getFullYear();
+      const monthNow = now.getMonth(); // 0–11
+      rangeStart = new Date(yearNow, monthNow, 1, 0, 0, 0, 0);
+      rangeEnd = new Date(yearNow, monthNow + 1, 0, 23, 59, 59, 999);
+    }
+
+    const period = yyyymmAR(rangeStart);
+    const year = rangeStart.getFullYear();
+    const month = rangeStart.getMonth();
+
+    const monthNamesEs = [
+      "enero","febrero","marzo","abril","mayo","junio",
+      "julio","agosto","septiembre","octubre","noviembre","diciembre",
+    ];
+    const label = `${monthNamesEs[month] || "Mes"} ${year}`.replace(
+      /^\w/,
+      (c) => c.toUpperCase()
+    );
 
     const daysInPeriod = new Date(year, month + 1, 0).getDate();
-    const daysElapsed = now.getDate();
+    const daysElapsed =
+      now.getFullYear() === year && now.getMonth() === month
+        ? now.getDate()
+        : daysInPeriod;
     const daysRemaining = Math.max(daysInPeriod - daysElapsed, 0);
 
-    // Días hábiles (lun–sáb) del mes
+    // Días hábiles (lun–sáb)
     const countWorkingDays = () => {
       let total = 0;
       let elapsed = 0;
-
       for (let d = 1; d <= daysInPeriod; d++) {
         const dt = new Date(year, month, d);
-        const day = dt.getDay(); // 0 = dom, 1 = lun, ..., 6 = sáb
-        const isWorking = day >= 1 && day <= 6; // lun–sáb
-
+        const day = dt.getDay(); // 0=dom..6=sáb
+        const isWorking = day >= 1 && day <= 6;
         if (!isWorking) continue;
         total++;
-        if (d <= daysElapsed) elapsed++;
+        if (
+          now.getFullYear() === year &&
+          now.getMonth() === month &&
+          d <= now.getDate()
+        ) {
+          elapsed++;
+        } else if (now.getFullYear() > year || now.getMonth() > month) {
+          elapsed = total;
+        }
       }
-      const remaining = Math.max(total - elapsed, 0);
-      return { total, elapsed, remaining };
+      return { total, elapsed, remaining: Math.max(total - elapsed, 0) };
     };
 
     const {
@@ -556,73 +614,46 @@ export async function getCollectorSummary(req, res, next) {
       remaining: workingDaysRemaining,
     } = countWorkingDays();
 
-    const diffInDays = (from, to) => {
-      const a = new Date(from);
-      const b = new Date(to);
-      if (Number.isNaN(a.getTime()) || Number.isNaN(b.getTime())) return 0;
-      const ms = b.getTime() - a.getTime();
-      return Math.max(0, Math.floor(ms / (1000 * 60 * 60 * 24)));
-    };
+    // ───────────────────── Config de comisión (User) ─────────────────────
+    let baseCommissionRate = 0;
+    let graceDays = 7;
+    let penaltyPerDay = 0;
 
-    /* ────────────────────── Config de comisión (User) ────────────────────── */
+    const userDoc = await User.findById(req.user._id)
+      .select("porcentajeCobrador commissionGraceDays commissionPenaltyPerDay name email idCobrador")
+      .lean();
 
-    // ✅ Defaults seguros
-    let baseCommissionRate = 0; // 0.05 = 5 %
-    let graceDays = 7; // días de gracia
-    let penaltyPerDay = 0; // 0 = sin penalidad
-
-    try {
-      const userDoc = await User.findById(req.user._id)
-        .select(
-          "porcentajeCobrador commissionGraceDays commissionPenaltyPerDay"
-        )
-        .lean();
-
-      if (userDoc) {
-        // Porcentaje principal (soporta 5 o 0.05)
-        const rawPercent = userDoc.porcentajeCobrador;
-        if (typeof rawPercent === "number" && rawPercent > 0) {
-          baseCommissionRate = rawPercent <= 1 ? rawPercent : rawPercent / 100;
-        }
-
-        // Días de gracia configurables
-        if (
-          userDoc.commissionGraceDays != null &&
-          Number.isFinite(Number(userDoc.commissionGraceDays))
-        ) {
-          graceDays = Number(userDoc.commissionGraceDays);
-        }
-
-        // Penalidad por día (soporta 0.1 = 10% de la tasa por día, o 10 = 10% también)
-        const rawPenalty = userDoc.commissionPenaltyPerDay;
-        if (typeof rawPenalty === "number" && rawPenalty > 0) {
-          penaltyPerDay = rawPenalty <= 1 ? rawPenalty : rawPenalty / 100;
-        }
+    if (userDoc) {
+      const rawPercent = userDoc.porcentajeCobrador;
+      if (typeof rawPercent === "number" && rawPercent > 0) {
+        baseCommissionRate = rawPercent <= 1 ? rawPercent : rawPercent / 100;
       }
-    } catch {
-      // Si falla el lookup, mantenemos defaults suaves
-      baseCommissionRate = 0;
-      graceDays = 7;
-      penaltyPerDay = 0;
+      if (
+        userDoc.commissionGraceDays != null &&
+        Number.isFinite(Number(userDoc.commissionGraceDays))
+      ) {
+        graceDays = Number(userDoc.commissionGraceDays);
+      }
+      const rawPenalty = userDoc.commissionPenaltyPerDay;
+      if (typeof rawPenalty === "number" && rawPenalty > 0) {
+        penaltyPerDay = rawPenalty <= 1 ? rawPenalty : rawPenalty / 100;
+      }
     }
 
-    /* ────────────────────── Clientes asignados y cuota del mes ────────────────────── */
-
+    // ───────────────── Clientes asignados + cuota vigente ─────────────────
     const clientsAgg = await Cliente.aggregate([
-      { $match: { idCobrador: myCollectorId } },
-
+      {
+        $match: {
+          $or: [{ idCobrador: myCollectorId }, { idCobrador: myCollectorIdStr }],
+        },
+      },
       {
         $addFields: {
           createdAtSafe: { $ifNull: ["$createdAt", { $toDate: "$_id" }] },
           _rankTitular: { $cond: [{ $eq: ["$rol", "TITULAR"] }, 0, 1] },
           _rankIntegrante: {
             $cond: [
-              {
-                $and: [
-                  { $isNumber: "$integrante" },
-                  { $gte: ["$integrante", 0] },
-                ],
-              },
+              { $and: [{ $isNumber: "$integrante" }, { $gte: ["$integrante", 0] }] },
               "$integrante",
               9999,
             ],
@@ -647,7 +678,6 @@ export async function getCollectorSummary(req, res, next) {
           },
         },
       },
-
       {
         $sort: {
           idCliente: 1,
@@ -657,7 +687,6 @@ export async function getCollectorSummary(req, res, next) {
           _id: 1,
         },
       },
-
       {
         $group: {
           _id: "$idCliente",
@@ -666,9 +695,7 @@ export async function getCollectorSummary(req, res, next) {
           isActive: { $max: "$__isActive" },
         },
       },
-
       { $match: { isActive: true } },
-
       {
         $group: {
           _id: null,
@@ -681,104 +708,58 @@ export async function getCollectorSummary(req, res, next) {
     const assignedClients = clientsAgg?.[0]?.assignedClients || 0;
     const totalChargeNow = clientsAgg?.[0]?.totalChargeNow || 0;
 
-    /* ────────────────────── Pagos del período + comisión pago a pago ────────────────────── */
-
-    const paymentsAgg = await Payment.aggregate([
+    // ───────────────── Movimientos cliente → cobrador (BASE REAL) ─────────────────
+    const ledgerAgg = await LedgerEntry.aggregate([
       {
         $match: {
-          "collector.idCobrador": myCollectorId,
-          status: { $in: ["posted", "settled"] },
+          accountCode: "CAJA_COBRADOR",
+          side: "debit",
+          "dimensions.idCliente": { $exists: true, $ne: null },
+          $or: [
+            { "dimensions.idCobrador": myCollectorId },
+            { "dimensions.idCobrador": myCollectorIdStr },
+          ],
           $expr: {
             $and: [
-              {
-                $gte: [{ $ifNull: ["$postedAt", "$createdAt"] }, monthStart],
-              },
-              {
-                $lte: [{ $ifNull: ["$postedAt", "$createdAt"] }, monthEnd],
-              },
+              { $gte: [{ $ifNull: ["$postedAt", "$createdAt"] }, rangeStart] },
+              { $lte: [{ $ifNull: ["$postedAt", "$createdAt"] }, rangeEnd] },
             ],
           },
-        },
-      },
-      { $unwind: "$allocations" },
-      {
-        $match: {
-          "allocations.period": period, // sólo lo imputado a este período
-        },
-      },
-      {
-        $project: {
-          _id: 1,
-          postedAt: { $ifNull: ["$postedAt", "$createdAt"] },
-          amountApplied: "$allocations.amountApplied",
-          cliente: 1,
-        },
-      },
-    ]).allowDiskUse(true);
-
-    const clientsSet = new Set();
-    let totalCollectedThisPeriod = 0;
-    let totalCommissionIdeal = 0; // sin penalidad
-    let totalCommissionDiscounted = 0; // con penalidad por demora
-
-    for (const p of paymentsAgg) {
-      const clientId = p.cliente?.idCliente;
-      if (clientId != null) clientsSet.add(clientId);
-
-      const applied = Number(p.amountApplied) || 0;
-      totalCollectedThisPeriod += applied;
-
-      // Comisión ideal si todo estuviera en término
-      const idealRate = baseCommissionRate;
-      const idealCommission = applied * idealRate;
-      totalCommissionIdeal += idealCommission;
-
-      // Comisión efectiva con descuento por demora (si corresponde)
-      let effectiveRate = idealRate;
-
-      if (idealRate > 0 && penaltyPerDay > 0 && p.postedAt) {
-        const daysHeld = diffInDays(p.postedAt, now);
-        if (daysHeld > graceDays) {
-          const extraDays = daysHeld - graceDays;
-          const reduction = penaltyPerDay * extraDays;
-          effectiveRate = Math.max(0, idealRate - reduction);
-        }
-      }
-
-      const discountedCommission = applied * effectiveRate;
-      totalCommissionDiscounted += discountedCommission;
-    }
-
-    const clientsWithPayment = clientsSet.size;
-    const clientsWithoutPayment = Math.max(
-      assignedClients - clientsWithPayment,
-      0
-    );
-
-    /* ────────────────────── Saldo en mano (Ledger) ────────────────────── */
-
-    const cashAccounts = ["CAJA_COBRADOR", "A_RENDIR_COBRADOR"];
-
-    const balanceAgg = await LedgerEntry.aggregate([
-      {
-        $match: {
-          "dimensions.idCobrador": myCollectorId,
-          accountCode: { $in: cashAccounts },
         },
       },
       {
         $group: {
           _id: null,
-          debits: {
-            $sum: {
-              $cond: [{ $eq: ["$side", "debit"] }, "$amount", 0],
-            },
-          },
-          credits: {
-            $sum: {
-              $cond: [{ $eq: ["$side", "credit"] }, "$amount", 0],
-            },
-          },
+          totalCollected: { $sum: "$amount" },
+          clients: { $addToSet: "$dimensions.idCliente" },
+        },
+      },
+    ]).allowDiskUse(true);
+
+    const totalCollectedThisPeriod = ledgerAgg?.[0]?.totalCollected || 0;
+    const clientsWithPayment = Array.isArray(ledgerAgg?.[0]?.clients)
+      ? ledgerAgg[0].clients.length
+      : 0;
+    const clientsWithoutPayment = Math.max(assignedClients - clientsWithPayment, 0);
+
+    // ───────────────── Saldo actual en mano del cobrador ─────────────────
+    const cashAccounts = ["CAJA_COBRADOR", "A_RENDIR_COBRADOR"];
+    const balanceAgg = await LedgerEntry.aggregate([
+      {
+        $match: {
+          accountCode: { $in: cashAccounts },
+          $or: [
+            { "dimensions.idCobrador": myCollectorId },
+            { "dimensions.idCobrador": myCollectorIdStr },
+            { "dimensions.cobradorId": myCollectorIdStr }, // compat viejas
+          ],
+        },
+      },
+      {
+        $group: {
+          _id: null,
+          debits: { $sum: { $cond: [{ $eq: ["$side", "debit"] }, "$amount", 0] } },
+          credits: { $sum: { $cond: [{ $eq: ["$side", "credit"] }, "$amount", 0] } },
         },
       },
     ]).allowDiskUse(true);
@@ -787,70 +768,77 @@ export async function getCollectorSummary(req, res, next) {
     const credits = balanceAgg?.[0]?.credits || 0;
     const collectorBalance = debits - credits;
 
-    /* ────────────────────── Comisiones globales ────────────────────── */
-
-    // Ganancia esperada: si cobrara toda la cartera en término
+    // ───────────────── Comisiones (igual admin) ─────────────────
     const expectedCommission = totalChargeNow * baseCommissionRate;
+    const totalCommission = totalCollectedThisPeriod * baseCommissionRate;
 
-    // Ganancia actual (con penalidad aplicada pago a pago)
-    const currentCommission = totalCommissionDiscounted;
+    const paidAgg = await LedgerEntry.aggregate([
+      {
+        $match: {
+          accountCode: "COMISION_COBRADOR",
+          side: "debit",
+          $or: [
+            { "dimensions.idCobrador": myCollectorId },
+            { "dimensions.idCobrador": myCollectorIdStr },
+          ],
+          $expr: {
+            $and: [
+              { $gte: [{ $ifNull: ["$postedAt", "$createdAt"] }, rangeStart] },
+              { $lte: [{ $ifNull: ["$postedAt", "$createdAt"] }, rangeEnd] },
+            ],
+          },
+        },
+      },
+      { $group: { _id: null, totalPaid: { $sum: "$amount" } } },
+    ]).allowDiskUse(true);
 
-    /* ────────────────────── Armado de respuesta ────────────────────── */
+    const alreadyPaid = paidAgg?.[0]?.totalPaid || 0;
+    const pendingCommission = Math.max(totalCommission - alreadyPaid, 0);
 
-    const monthNamesEs = [
-      "enero",
-      "febrero",
-      "marzo",
-      "abril",
-      "mayo",
-      "junio",
-      "julio",
-      "agosto",
-      "septiembre",
-      "octubre",
-      "noviembre",
-      "diciembre",
-    ];
-    const label = `${monthNamesEs[month] || "Mes"} ${year}`.replace(
-      /^\w/,
-      (c) => c.toUpperCase()
-    );
+    const rootAmounts = {
+      expectedCommission,
+      totalCommission,
+      totalCommissionNoPenalty: totalCommission, // (igual que admin por ahora)
+      alreadyPaid,
+      pendingCommission,
+    };
 
     return res.json({
       ok: true,
       data: {
-        assignedClients,
+        collector: {
+          userId: req.user?._id,
+          name: userDoc?.name || null,
+          email: userDoc?.email || null,
+          idCobrador: myCollectorId,
+        },
         month: {
-          period, // "YYYY-MM"
+          period,
           label,
-          // días de calendario
           daysInPeriod,
           daysElapsed,
           daysRemaining,
-          // días hábiles (lun–sáb)
           workingDaysTotal,
           workingDaysElapsed,
           workingDaysRemaining,
-          // cobranza
-          totalChargeNow, // suma de cuotas vigentes de la cartera
+          totalChargeNow,
           totalCollectedThisPeriod,
           clientsWithPayment,
           clientsWithoutPayment,
+          assignedClients, // útil para UI
         },
         balance: {
           collectorBalance,
         },
+        // mismo contrato que admin
+        amounts: rootAmounts,
         commissions: {
           config: {
-            basePercent: baseCommissionRate, // decimal (0.05 = 5 %)
+            basePercent: baseCommissionRate,
             graceDays,
-            penaltyPerDay, // decimal, caída de la tasa por día extra
+            penaltyPerDay,
           },
-          amounts: {
-            expectedCommission, // si cobrara toda la cartera en término
-            totalCommission: currentCommission, // ya con descuento
-            totalCommissionNoPenalty: totalCommissionIdeal, // referencia sin descuento
-          },
+          amounts: rootAmounts,
         },
       },
     });
@@ -858,3 +846,4 @@ export async function getCollectorSummary(req, res, next) {
     next(err);
   }
 }
+

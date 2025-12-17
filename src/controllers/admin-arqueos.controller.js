@@ -3,17 +3,18 @@ import User from "../models/user.model.js";
 import LedgerEntry from "../models/ledger-entry.model.js";
 import Payment from "../models/payment.model.js";
 import Cliente from "../models/client.model.js";
+
 // ───────────────────── Helpers ─────────────────────
 const toInt = (v, d = 0) => {
   const n = Number.parseInt(v, 10);
   return Number.isFinite(n) ? n : d;
 };
-// ⬇️ Colocá esto arriba del archivo (o importá tu util real)
+
 function yyyymmAR(date) {
   const d = date instanceof Date ? date : new Date(date);
   const y = d.getFullYear();
   const m = String(d.getMonth() + 1).padStart(2, "0");
-  return `${y}-${m}`; // formato "YYYY-MM" como espera allocations.period
+  return `${y}-${m}`; // "YYYY-MM"
 }
 
 const toDir = (v) => (String(v || "").toLowerCase() === "asc" ? 1 : -1);
@@ -39,11 +40,7 @@ const DEFAULT_ACCOUNTS = ["CAJA_COBRADOR", "A_RENDIR_COBRADOR"];
 const CAJA_CHICA = "CAJA_CHICA"; // global
 const CAJA_GRANDE = "CAJA_GRANDE"; // global
 const CAJA_SUPERADMIN = "CAJA_SUPERADMIN"; // personal SA
-
-// Conjunto por defecto para superAdmin (incluye globales + su billetera personal)
 const SUPERADMIN_ACCOUNTS = [CAJA_GRANDE, CAJA_SUPERADMIN, CAJA_CHICA];
-
-// Roles con caja
 const BOX_ROLES = ["cobrador", "admin", "superAdmin"];
 
 // Detecta si un string parece ObjectId
@@ -70,7 +67,6 @@ const monthNamesEs = [
   "noviembre",
   "diciembre",
 ];
-
 const normalizeDateStart = (v) => {
   if (!v) return null;
   const d = new Date(v);
@@ -78,7 +74,6 @@ const normalizeDateStart = (v) => {
   d.setHours(0, 0, 0, 0);
   return d;
 };
-
 const normalizeDateEnd = (v) => {
   if (!v) return null;
   const d = new Date(v);
@@ -86,7 +81,6 @@ const normalizeDateEnd = (v) => {
   d.setHours(23, 59, 59, 999);
   return d;
 };
-
 const diffInDays = (from, to) => {
   const a = new Date(from);
   const b = new Date(to);
@@ -94,157 +88,15 @@ const diffInDays = (from, to) => {
   const ms = b.getTime() - a.getTime();
   return Math.max(0, Math.floor(ms / (1000 * 60 * 60 * 24)));
 };
-// Helper local para validar si algo "parece" un ObjectId
 const isObjectIdLike = (v) => {
   if (!v) return false;
   try {
-    // fuerza a string por las dudas
     new mongoose.Types.ObjectId(String(v));
     return true;
   } catch {
     return false;
   }
 };
-
-// 🔧 Match unificado por usuario y cuentas
-// - admin / superAdmin: match estricto por userId
-// - cobrador: match por userId|fromUserId|toUserId ó por dimensions.idCobrador/cobradorId
-function buildUserLedgerMatch({ user, accounts, fromDt, toDt, side }) {
-  const uid = new mongoose.Types.ObjectId(String(user._id));
-
-  const byUserId = [
-    { userId: uid },
-    { "dimensions.fromUserId": uid },
-    { "dimensions.toUserId": uid },
-  ];
-
-  const byCollectorId =
-    user.role === "cobrador" && user.idCobrador != null
-      ? [
-          {
-            $expr: {
-              $eq: [
-                { $toString: "$dimensions.idCobrador" },
-                { $toString: String(user.idCobrador) },
-              ],
-            },
-          },
-          {
-            $expr: {
-              $eq: [
-                { $toString: "$dimensions.cobradorId" },
-                { $toString: String(user.idCobrador) },
-              ],
-            },
-          },
-        ]
-      : [];
-
-  // Base por cuentas
-  const match = { accountCode: { $in: accounts } };
-
-  if (user.role === "admin" || user.role === "superAdmin") {
-    // Vinculación estricta por userId (las globales se consultan por endpoints específicos)
-    match.userId = uid;
-  } else {
-    // Cobrador: laxo
-    match.$or = [...byUserId, ...byCollectorId];
-  }
-
-  if (side === "debit" || side === "credit") match.side = side;
-
-  if (fromDt || toDt) {
-    match.postedAt = {};
-    if (fromDt) match.postedAt.$gte = fromDt;
-    if (toDt) match.postedAt.$lte = toDt;
-  }
-
-  return match;
-}
-
-async function createLedgerTransfer({
-  from, // { userId, accountCode }
-  to, // { userId, accountCode }
-  amount,
-  currency = "ARS",
-  kind, // ej. "CAJA_CHICA_DEPOSITO"
-  note = "",
-  extraDims = {}, // { idCobrador, dateFrom, dateTo, performedBy, ... }
-  idemScope = "", // string para idempotencia contextual
-}) {
-  if (!from?.userId || !to?.userId) {
-    throw new Error("createLedgerTransfer: faltan userId origen/destino");
-  }
-  if (!from?.accountCode || !to?.accountCode) {
-    throw new Error("createLedgerTransfer: faltan cuentas origen/destino");
-  }
-  const amt = Number(amount);
-  if (!Number.isFinite(amt) || amt <= 0) {
-    throw new Error("createLedgerTransfer: monto inválido");
-  }
-
-  const now = new Date();
-  const paymentId = new mongoose.Types.ObjectId();
-  const idemKey = [
-    "xfer",
-    kind || "GENERIC",
-    String(from.userId),
-    from.accountCode,
-    String(to.userId),
-    to.accountCode,
-    currency,
-    Math.floor(now.getTime() / 60000), // granularidad minuto
-    idemScope || "",
-  ].join(":");
-
-  // Evitar duplicados (chequea línea destino DEBIT con el idemKey)
-  const exists = await LedgerEntry.findOne({
-    "dimensions.idemKey": idemKey,
-    userId: to.userId,
-    accountCode: to.accountCode,
-    side: "debit",
-    currency,
-  }).lean();
-  if (exists) return { ok: true, skipped: true, paymentId, idemKey };
-
-  const dims = {
-    kind: kind || "GENERIC",
-    note,
-    idemKey,
-    fromUserId: from.userId,
-    toUserId: to.userId,
-    ...extraDims,
-  };
-
-  const creditOut = {
-    paymentId,
-    userId: from.userId,
-    accountCode: from.accountCode,
-    side: "credit",
-    amount: amt,
-    currency,
-    postedAt: now,
-    dimensions: dims,
-  };
-
-  const debitIn = {
-    paymentId,
-    userId: to.userId,
-    accountCode: to.accountCode,
-    side: "debit",
-    amount: amt,
-    currency,
-    postedAt: now,
-    dimensions: dims,
-  };
-
-  const entries = await LedgerEntry.insertMany([creditOut, debitIn], {
-    ordered: true,
-  });
-
-  return { ok: true, paymentId, idemKey, entryIds: entries.map((e) => e._id) };
-}
-
 async function getBalance({
   userId,
   accountCode,
@@ -274,8 +126,6 @@ async function getBalance({
 
   return Number(r?.[0]?.balance || 0);
 }
-
-// Opcional: exportar lo que uses desde otros módulos
 export {
   toInt,
   parseISODate,
@@ -289,29 +139,22 @@ export {
   SUPERADMIN_ACCOUNTS,
   BOX_ROLES,
   asObjectId,
-  buildUserLedgerMatch,
-  createLedgerTransfer,
   getBalance,
 };
-
-/* ======================= 1) Listado de usuarios (cajas) ======================= */
-/**
- * GET /api/admin/arqueos/usuarios
- * Query: q, role, sortBy, sortDir, accountCodes, destAccountCode, dateFrom, dateTo, page, limit
- */
 export async function listArqueosUsuarios(req, res, next) {
   try {
     const page = Math.max(toInt(req.query.page, 1), 1);
     const limit = Math.max(Math.min(toInt(req.query.limit || 25, 25), 200), 1);
+
     const q = String(req.query.q || "").trim();
-    const roleFilter = String(req.query.role || "").trim(); // "admin" | "superAdmin" | "cobrador" | "global" | ""
+    const roleFilter = String(req.query.role || "").trim();
+
     const sortByParam = String(req.query.sortBy || "totalBalance");
-    const sortDirParam = toDir(req.query.sortDir || "desc"); // 1 = asc, -1 = desc
-    const orderMode = String(req.query.orderMode || "default"); // "default" | "hierarchy"
+    const sortDirParam = toDir(req.query.sortDir || "desc");
+    const orderMode = String(req.query.orderMode || "default");
 
     const viewerRole = String(req.user?.role || "").trim();
 
-    // Quiénes pueden listar "usuarios" reales (las cajas globales se inyectan aparte)
     const ALLOWED_BY_VIEWER =
       viewerRole === "superAdmin"
         ? ["superAdmin", "admin", "cobrador"]
@@ -331,11 +174,12 @@ export async function listArqueosUsuarios(req, res, next) {
     const fromDt = parseISODate(req.query.dateFrom);
     const toDt = parseISODate(req.query.dateTo, true);
 
-    // ---------- Filtro de usuarios reales
     const userMatch = { role: { $in: ALLOWED_BY_VIEWER } };
+
     if (roleFilter && ALLOWED_BY_VIEWER.includes(roleFilter)) {
       userMatch.role = roleFilter;
     }
+
     if (q) {
       const oid = asObjectId(q);
       userMatch.$or = [
@@ -345,19 +189,133 @@ export async function listArqueosUsuarios(req, res, next) {
       ];
     }
 
-    // ---------- Pipeline base (no paginamos aún; inyectamos globales y luego paginamos)
+    // ✅ IMPORTANTE: como ya corregiste los controllers,
+    // ✅ toUser SIEMPRE ES EL DUEÑO DE LA LÍNEA.
+    // => arqueos por usuario: match por toUser (normalizado)
+
     const base = [
       { $match: userMatch },
+
+      // aliases del usuario (lowercase) para matchear toUser
+      {
+        $addFields: {
+          __aliasesLower: {
+            $setDifference: [
+              {
+                $filter: {
+                  input: {
+                    $setUnion: [
+                      // name + email
+                      [
+                        {
+                          $toLower: {
+                            $trim: { input: { $ifNull: ["$name", ""] } },
+                          },
+                        },
+                        {
+                          $toLower: {
+                            $trim: { input: { $ifNull: ["$email", ""] } },
+                          },
+                        },
+                      ],
+
+                      // cobrador #id
+                      [
+                        {
+                          $cond: [
+                            {
+                              $and: [
+                                { $eq: ["$role", "cobrador"] },
+                                { $ne: ["$idCobrador", null] },
+                              ],
+                            },
+                            {
+                              $toLower: {
+                                $concat: [
+                                  "cobrador #",
+                                  { $toString: "$idCobrador" },
+                                ],
+                              },
+                            },
+                            "",
+                          ],
+                        },
+                      ],
+
+                      // labels legacy típicos (por si quedaron movimientos viejos)
+                      [
+                        { $cond: [{ $eq: ["$role", "admin"] }, "admin", ""] },
+                        {
+                          $cond: [
+                            { $eq: ["$role", "admin"] },
+                            "administración",
+                            "",
+                          ],
+                        },
+                        {
+                          $cond: [
+                            { $eq: ["$role", "admin"] },
+                            "administracion",
+                            "",
+                          ],
+                        },
+                        {
+                          $cond: [{ $eq: ["$role", "admin"] }, "caja_admin", ""],
+                        },
+
+                        {
+                          $cond: [
+                            { $eq: ["$role", "superAdmin"] },
+                            "superadmin",
+                            "",
+                          ],
+                        },
+                        {
+                          $cond: [
+                            { $eq: ["$role", "superAdmin"] },
+                            "super admin",
+                            "",
+                          ],
+                        },
+                        {
+                          $cond: [
+                            { $eq: ["$role", "superAdmin"] },
+                            "caja_superadmin",
+                            "",
+                          ],
+                        },
+                      ],
+                    ],
+                  },
+                  as: "x",
+                  cond: { $gt: [{ $strLenCP: "$$x" }, 0] },
+                },
+              },
+              [""],
+            ],
+          },
+        },
+      },
+
       {
         $lookup: {
           from: LedgerEntry.collection.name,
-          let: { uid: "$_id", urole: "$role", idCob: "$idCobrador" },
+          let: { urole: "$role", aliasesLower: "$__aliasesLower" },
           pipeline: [
+            {
+              $addFields: {
+                __toLower: {
+                  $toLower: {
+                    $trim: { input: { $ifNull: ["$toUser", ""] } },
+                  },
+                },
+              },
+            },
             {
               $match: {
                 $expr: {
                   $and: [
-                    // 1) Cuentas por rol (si no hay override)
+                    // 1) cuentas permitidas por rol (o override)
                     {
                       $in: [
                         "$accountCode",
@@ -365,15 +323,12 @@ export async function listArqueosUsuarios(req, res, next) {
                           ? accountCodesOverride
                           : {
                               $cond: [
-                                // admin => sólo cuenta destino (p.ej. CAJA_ADMIN o DEST_DEFAULT)
                                 { $eq: ["$$urole", "admin"] },
                                 [destAccountCode],
                                 {
                                   $cond: [
-                                    // superAdmin => SOLO personal: CAJA_SUPERADMIN (NUNCA GRANDE acá)
                                     { $eq: ["$$urole", "superAdmin"] },
                                     ["CAJA_SUPERADMIN"],
-                                    // cobrador => cuentas por defecto
                                     DEFAULT_ACCOUNTS,
                                   ],
                                 },
@@ -382,66 +337,10 @@ export async function listArqueosUsuarios(req, res, next) {
                       ],
                     },
 
-                    // 2) Vinculación por usuario:
-                    //    - admin/superAdmin: SOLO userId == uid
-                    //    - cobrador: userId|fromUserId|toUserId == uid  OR  dimensions.idCobrador/cobradorId == idCob
-                    {
-                      $cond: [
-                        { $in: ["$$urole", ["admin", "superAdmin"]] },
-                        {
-                          $eq: [
-                            { $toString: "$userId" },
-                            { $toString: "$$uid" },
-                          ],
-                        },
-                        {
-                          $or: [
-                            {
-                              $eq: [
-                                { $toString: "$userId" },
-                                { $toString: "$$uid" },
-                              ],
-                            },
-                            {
-                              $eq: [
-                                { $toString: "$dimensions.fromUserId" },
-                                { $toString: "$$uid" },
-                              ],
-                            },
-                            {
-                              $eq: [
-                                { $toString: "$dimensions.toUserId" },
-                                { $toString: "$$uid" },
-                              ],
-                            },
-                            {
-                              $and: [
-                                { $ne: ["$$idCob", null] },
-                                {
-                                  $eq: [
-                                    { $toString: "$dimensions.idCobrador" },
-                                    { $toString: "$$idCob" },
-                                  ],
-                                },
-                              ],
-                            },
-                            {
-                              $and: [
-                                { $ne: ["$$idCob", null] },
-                                {
-                                  $eq: [
-                                    { $toString: "$dimensions.cobradorId" },
-                                    { $toString: "$$idCob" },
-                                  ],
-                                },
-                              ],
-                            },
-                          ],
-                        },
-                      ],
-                    },
+                    // 2) dueño = toUser
+                    { $in: ["$__toLower", "$$aliasesLower"] },
 
-                    // 3) Rango de fechas (opcional)
+                    // 3) rango postedAt
                     ...(fromDt || toDt
                       ? [
                           {
@@ -463,8 +362,24 @@ export async function listArqueosUsuarios(req, res, next) {
             {
               $group: {
                 _id: { currency: "$currency" },
-                debits: debitExpr,
-                credits: creditExpr,
+                debits: {
+                  $sum: {
+                    $cond: [
+                      { $eq: ["$side", "debit"] },
+                      { $ifNull: ["$amount", 0] },
+                      0,
+                    ],
+                  },
+                },
+                credits: {
+                  $sum: {
+                    $cond: [
+                      { $eq: ["$side", "credit"] },
+                      { $ifNull: ["$amount", 0] },
+                      0,
+                    ],
+                  },
+                },
                 lastMovementAt: { $max: "$postedAt" },
                 paymentsSet: { $addToSet: "$paymentId" },
               },
@@ -484,6 +399,7 @@ export async function listArqueosUsuarios(req, res, next) {
           as: "boxes",
         },
       },
+
       {
         $addFields: {
           totalBalance: {
@@ -531,182 +447,19 @@ export async function listArqueosUsuarios(req, res, next) {
       User.aggregate(countPipeline).allowDiskUse(true),
     ]);
 
-    const totalReal = countRes?.[0]?.n || 0;
+    const total = countRes?.[0]?.n || 0;
 
-    // ---------- Inyección de "usuarios virtuales" (cajas globales) cuando el viewer es SA
-    let merged = realItems;
-    let globalsAdded = 0;
-
-    const includeGlobals =
-      viewerRole === "superAdmin" &&
-      (!roleFilter || roleFilter === "" || roleFilter === "global");
-
-    if (includeGlobals) {
-      const matchDate =
-        fromDt || toDt
-          ? {
-              postedAt: {
-                ...(fromDt ? { $gte: fromDt } : {}),
-                ...(toDt ? { $lte: toDt } : {}),
-              },
-            }
-          : {};
-
-      const makeGlobalBoxes = async (accCode) => {
-        const boxes = await LedgerEntry.aggregate([
-          { $match: { accountCode: accCode, ...matchDate } },
-          {
-            $group: {
-              _id: { currency: "$currency" },
-              debits: debitExpr,
-              credits: creditExpr,
-              lastMovementAt: { $max: "$postedAt" },
-              paymentsSet: { $addToSet: "$paymentId" },
-            },
-          },
-          {
-            $project: {
-              _id: 0,
-              currency: "$_id.currency",
-              debits: 1,
-              credits: 1,
-              balance: { $subtract: ["$debits", "$credits"] },
-              lastMovementAt: 1,
-              paymentsCount: { $size: "$paymentsSet" },
-            },
-          },
-        ]);
-
-        const totalBalance = (boxes || []).reduce(
-          (s, b) => s + Number(b?.balance || 0),
-          0
-        );
-        const lastMovementAt = (boxes || []).reduce((max, b) => {
-          const d = b?.lastMovementAt ? new Date(b.lastMovementAt) : null;
-          return d && !isNaN(d) && (!max || d > max) ? d : max;
-        }, null);
-        const paymentsCount = (boxes || []).reduce(
-          (s, b) => s + Number(b?.paymentsCount || 0),
-          0
-        );
-
-        return { boxes, totalBalance, lastMovementAt, paymentsCount };
-      };
-
-      // ⬅️ AHORA traemos también BANCO_NACION y TARJETA_NARANJA
-      const [chica, grande, bancoNacion, tarjetaNaranja] = await Promise.all([
-        makeGlobalBoxes("CAJA_CHICA"),
-        makeGlobalBoxes("CAJA_GRANDE"),
-        makeGlobalBoxes("BANCO_NACION"),
-        makeGlobalBoxes("TARJETA_NARANJA"),
-      ]);
-
-      const globalRows = [
-        {
-          _id: "GLOBAL:CAJA_GRANDE",
-          name: "CAJA_GRANDE (GLOBAL)",
-          email: "",
-          role: "global",
-          boxes: grande.boxes,
-          totalBalance: grande.totalBalance,
-          lastMovementAt: grande.lastMovementAt,
-          paymentsCount: grande.paymentsCount,
-          isGlobal: true,
-          globalCode: "CAJA_GRANDE",
-        },
-        {
-          _id: "GLOBAL:CAJA_CHICA",
-          name: "CAJA_CHICA (GLOBAL)",
-          email: "",
-          role: "global",
-          boxes: chica.boxes,
-          totalBalance: chica.totalBalance,
-          lastMovementAt: chica.lastMovementAt,
-          paymentsCount: chica.paymentsCount,
-          isGlobal: true,
-          globalCode: "CAJA_CHICA",
-        },
-        {
-          _id: "GLOBAL:BANCO_NACION",
-          name: "BANCO_NACION (GLOBAL)",
-          email: "",
-          role: "global",
-          boxes: bancoNacion.boxes,
-          totalBalance: bancoNacion.totalBalance,
-          lastMovementAt: bancoNacion.lastMovementAt,
-          paymentsCount: bancoNacion.paymentsCount,
-          isGlobal: true,
-          globalCode: "BANCO_NACION",
-        },
-        {
-          _id: "GLOBAL:TARJETA_NARANJA",
-          name: "TARJETA_NARANJA (GLOBAL)",
-          email: "",
-          role: "global",
-          boxes: tarjetaNaranja.boxes,
-          totalBalance: tarjetaNaranja.totalBalance,
-          lastMovementAt: tarjetaNaranja.lastMovementAt,
-          paymentsCount: tarjetaNaranja.paymentsCount,
-          isGlobal: true,
-          globalCode: "TARJETA_NARANJA",
-        },
-      ];
-
-      const matchesQ = (row) =>
-        !q ||
-        String(row.name || "")
-          .toLowerCase()
-          .includes(q.toLowerCase()) ||
-        String(row._id || "")
-          .toLowerCase()
-          .includes(q.toLowerCase());
-
-      const filteredGlobals = globalRows.filter(matchesQ);
-      globalsAdded = filteredGlobals.length;
-
-      merged = [...realItems, ...filteredGlobals];
-    }
-
-    // ---------- Orden final (jerárquico si se solicita)
-    function orderRank(row) {
-      const id = String(row?._id || "");
-      const role = String(row?.role || "");
-
-      if (id === "GLOBAL:CAJA_GRANDE") return 0;
-      if (id === "GLOBAL:CAJA_CHICA") return 1;
-      if (id === "GLOBAL:BANCO_NACION") return 2;
-      if (id === "GLOBAL:TARJETA_NARANJA") return 3;
-      if (role === "superAdmin") return 4;
-      if (role === "admin") return 5;
-      if (role === "cobrador") return 6;
-      return 7;
-    }
-
-    const finalSorted =
-      orderMode === "hierarchy"
-        ? [...merged].sort((a, b) => {
-            const ra = orderRank(a);
-            const rb = orderRank(b);
-            if (ra !== rb) return ra - rb;
-
-            // Dentro del bloque, usamos el sort original pedido por query
-            const av = a[sortBy] ?? (sortBy === "name" ? "" : 0);
-            const bv = b[sortBy] ?? (sortBy === "name" ? "" : 0);
-            if (av < bv) return sortDirParam;
-            if (av > bv) return -sortDirParam;
-            return String(a._id).localeCompare(String(b._id)) * sortDirParam;
-          })
-        : merged;
-
-    // ---------- Paginado final
-    const total = totalReal + globalsAdded;
     const start = (page - 1) * limit;
     const end = start + limit;
-    const paged = finalSorted.slice(start, end);
+
+    const finalItems =
+      orderMode === "default"
+        ? realItems.slice(start, end)
+        : realItems.slice(start, end); // (si querés jerarquía acá, lo enchufamos después)
 
     return res.json({
       ok: true,
-      items: paged,
+      items: finalItems,
       total,
       page,
       pageSize: limit,
@@ -721,20 +474,12 @@ export async function listArqueosUsuarios(req, res, next) {
             : roleFilter === "global"
             ? "global"
             : null,
-        accountCodes: accountCodesOverride || {
-          superAdmin: ["CAJA_SUPERADMIN"], // <- SA no suma GRANDE aquí
-          admin: [destAccountCode],
-          cobrador: DEFAULT_ACCOUNTS,
-        },
         dateFrom: req.query.dateFrom || null,
         dateTo: req.query.dateTo || null,
         q,
         destAccountCode,
-        injectedGlobals:
-          viewerRole === "superAdmin"
-            ? ["CAJA_CHICA", "CAJA_GRANDE", "BANCO_NACION", "TARJETA_NARANJA"]
-            : [],
         orderMode,
+        ownerMatch: "toUser (owner of line)",
       },
     });
   } catch (err) {
@@ -742,10 +487,6 @@ export async function listArqueosUsuarios(req, res, next) {
   }
 }
 
-/* ======================= 2) Detalle de movimientos ======================= */
-/**
- * GET /api/admin/arqueos/usuarios/detalle
- */
 export async function getArqueoUsuarioDetalle(req, res, next) {
   try {
     const page = Math.max(toInt(req.query.page, 1), 1);
@@ -762,6 +503,7 @@ export async function getArqueoUsuarioDetalle(req, res, next) {
 
     const destAccountCode =
       String(req.query.destAccountCode || "").trim() || DEST_DEFAULT;
+
     const fromDt = parseISODate(req.query.dateFrom);
     const toDt = parseISODate(req.query.dateTo, true);
     const side = String(req.query.side || "");
@@ -776,22 +518,15 @@ export async function getArqueoUsuarioDetalle(req, res, next) {
     const sortBy = SORTABLE.has(sortByParam) ? sortByParam : "postedAt";
     const sortStage = { $sort: { [sortBy]: sortDirParam, _id: sortDirParam } };
 
-    /* ────────────────────── RAMA: CAJAS GLOBALES ──────────────────────
-       IDs como: "GLOBAL:CAJA_GRANDE", "GLOBAL:BANCO_NACION", etc.
-       No hay usuario real, filtramos directamente por accountCode.
-    ------------------------------------------------------------------ */
     const isGlobal = rawUserId.startsWith("GLOBAL:");
 
+    // ───────────────────────── RAMA GLOBAL ─────────────────────────
     if (isGlobal) {
       const globalCode = rawUserId.replace(/^GLOBAL:/, "").trim();
 
-      // Cuentas efectivas para la caja global:
-      // - Si viene override, se respetan.
-      // - Si no, se toma el código global de la fila.
       const effectiveAccounts =
         accountCodesOverride.length > 0 ? accountCodesOverride : [globalCode];
 
-      // Match básico por cuenta, fechas y side (si viene)
       const match = {
         accountCode: { $in: effectiveAccounts },
       };
@@ -838,6 +573,12 @@ export async function getArqueoUsuarioDetalle(req, res, next) {
           $project: {
             _id: 1,
             paymentId: 1,
+            kind: 1,
+            userId: 1,
+            fromUser: 1,
+            toUser: 1,
+            fromAccountCode: 1,
+            toAccountCode: 1,
             side: 1,
             accountCode: 1,
             amount: 1,
@@ -869,7 +610,6 @@ export async function getArqueoUsuarioDetalle(req, res, next) {
       };
       const total = countRes?.[0]?.n || 0;
 
-      // "Usuario" virtual para header
       const user = {
         _id: rawUserId,
         name: `${globalCode} (GLOBAL)`,
@@ -899,59 +639,91 @@ export async function getArqueoUsuarioDetalle(req, res, next) {
       });
     }
 
-    /* ────────────────────── RAMA: USUARIOS REALES ────────────────────── */
+    // ────────────────────── RAMA USUARIO REAL ──────────────────────
+    const user = await User.findById(rawUserId)
+      .select("_id name email role idCobrador")
+      .lean();
 
-    // Resolver usuario real
-    let user = null;
-    if (rawUserId) {
-      user = await User.findById(rawUserId)
-        .select("_id name email role idCobrador")
-        .lean();
-    } else if (req.query.idCobrador != null) {
-      user =
-        (await User.findOne({ idCobrador: String(req.query.idCobrador) })
-          .select("_id name email role idCobrador")
-          .lean()) ||
-        (await User.findOne({ idCobrador: Number(req.query.idCobrador) })
-          .select("_id name email role idCobrador")
-          .lean());
+    if (!user) {
+      return res.status(400).json({ ok: false, message: "Usuario no encontrado" });
     }
-
-    if (!user)
-      return res
-        .status(400)
-        .json({ ok: false, message: "Usuario no encontrado" });
-    if (!BOX_ROLES.includes(user.role))
-      return res
-        .status(403)
-        .json({ ok: false, message: "Rol sin caja habilitada" });
+    if (!BOX_ROLES.includes(user.role)) {
+      return res.status(403).json({ ok: false, message: "Rol sin caja habilitada" });
+    }
 
     const effectiveAccounts =
       accountCodesOverride.length > 0
         ? accountCodesOverride
         : user.role === "admin"
-        ? [destAccountCode] // CAJA_ADMIN (u otra dest)
+        ? [destAccountCode]
         : user.role === "superAdmin"
-        ? SUPERADMIN_ACCOUNTS // ⬅️ CAJA_GRANDE + CAJA_SUPERADMIN (personal del SA)
-        : DEFAULT_ACCOUNTS; // cobrador
+        ? SUPERADMIN_ACCOUNTS
+        : DEFAULT_ACCOUNTS;
 
-    const match = buildUserLedgerMatch({
-      user,
-      accounts: effectiveAccounts,
-      fromDt,
-      toDt,
-      side,
-    });
+    const aliasesLower = [
+      String(user.name || "").trim().toLowerCase(),
+      String(user.email || "").trim().toLowerCase(),
+      user.role === "cobrador" && user.idCobrador != null
+        ? `cobrador #${String(user.idCobrador)}`.toLowerCase()
+        : "",
+      user.role === "admin" ? "admin" : "",
+      user.role === "admin" ? "administración" : "",
+      user.role === "admin" ? "administracion" : "",
+      user.role === "admin" ? "caja_admin" : "",
+      user.role === "superAdmin" ? "superadmin" : "",
+      user.role === "superAdmin" ? "super admin" : "",
+      user.role === "superAdmin" ? "caja_superadmin" : "",
+    ].filter(Boolean);
 
-    const base = [{ $match: match }];
+    const baseMatch = {
+      accountCode: { $in: effectiveAccounts },
+      ...(fromDt || toDt
+        ? {
+            postedAt: {
+              ...(fromDt ? { $gte: fromDt } : {}),
+              ...(toDt ? { $lte: toDt } : {}),
+            },
+          }
+        : {}),
+      ...(side === "debit" || side === "credit" ? { side } : {}),
+    };
+
+    // ✅ owner = toUser
+    const base = [
+      { $match: baseMatch },
+      {
+        $addFields: {
+          __toLower: {
+            $toLower: { $trim: { input: { $ifNull: ["$toUser", ""] } } },
+          },
+        },
+      },
+      { $match: { __toLower: { $in: aliasesLower } } },
+    ];
 
     const totalsPipeline = [
       ...base,
       {
         $group: {
           _id: null,
-          debits: debitExpr,
-          credits: creditExpr,
+          debits: {
+            $sum: {
+              $cond: [
+                { $eq: ["$side", "debit"] },
+                { $ifNull: ["$amount", 0] },
+                0,
+              ],
+            },
+          },
+          credits: {
+            $sum: {
+              $cond: [
+                { $eq: ["$side", "credit"] },
+                { $ifNull: ["$amount", 0] },
+                0,
+              ],
+            },
+          },
           lastMovementAt: { $max: "$postedAt" },
           paymentsSet: { $addToSet: "$paymentId" },
         },
@@ -974,6 +746,12 @@ export async function getArqueoUsuarioDetalle(req, res, next) {
         $project: {
           _id: 1,
           paymentId: 1,
+          kind: 1,
+          userId: 1,
+          fromUser: 1,
+          toUser: 1,
+          fromAccountCode: 1,
+          toAccountCode: 1,
           side: 1,
           accountCode: 1,
           amount: 1,
@@ -1003,6 +781,7 @@ export async function getArqueoUsuarioDetalle(req, res, next) {
       lastMovementAt: null,
       paymentsCount: 0,
     };
+
     const total = countRes?.[0]?.n || 0;
 
     return res.json({
@@ -1021,24 +800,23 @@ export async function getArqueoUsuarioDetalle(req, res, next) {
         side: side || null,
         destAccountCode,
         isGlobal: false,
+        ownerMatch: "toUser (owner of line)",
+        aliasesLower,
       },
     });
   } catch (err) {
     next(err);
   }
 }
-
-/* ======================= 3) Crear arqueo (mueve fondos) ======================= */
-/**
- * POST /api/admin/arqueos/usuarios/arqueo
- * Body: { userId | idCobrador, note, accountCodes?, dateFrom?, dateTo?, destAccountCode?, minAmount? }
- */
 export async function crearArqueoUsuario(req, res, next) {
+  const session = await mongoose.startSession();
+  session.startTransaction();
+
   try {
     const {
       userId: bodyUserId,
       idCobrador,
-      note,
+      note = "",
       accountCodes,
       dateFrom: df,
       dateTo: dt,
@@ -1046,53 +824,90 @@ export async function crearArqueoUsuario(req, res, next) {
       minAmount = 1,
     } = req.body || {};
 
-    // 1) Cobrador origen
+    // 0) permisos mínimos
+    const viewerRole = String(req.user?.role || "").trim();
+    if (!["admin", "superAdmin"].includes(viewerRole)) {
+      await session.abortTransaction();
+      return res
+        .status(403)
+        .json({ ok: false, message: "Permisos insuficientes" });
+    }
+
+    // 1) Cobrador origen (puede ser cobrador/admin/superAdmin si tiene caja)
     let cobradorUser = null;
     if (bodyUserId) {
       cobradorUser = await User.findById(bodyUserId)
         .select("_id name email role idCobrador")
+        .session(session)
         .lean();
     } else if (idCobrador != null) {
       cobradorUser =
         (await User.findOne({ idCobrador: String(idCobrador) })
           .select("_id name email role idCobrador")
+          .session(session)
           .lean()) ||
         (await User.findOne({ idCobrador: Number(idCobrador) })
           .select("_id name email role idCobrador")
+          .session(session)
           .lean());
     }
-    if (!cobradorUser)
+
+    if (!cobradorUser) {
+      await session.abortTransaction();
       return res
         .status(400)
         .json({ ok: false, message: "Usuario cobrador no encontrado" });
-    if (!BOX_ROLES.includes(cobradorUser.role))
+    }
+    if (!BOX_ROLES.includes(cobradorUser.role)) {
+      await session.abortTransaction();
       return res
         .status(403)
-        .json({ ok: false, message: "Rol de cobrador sin caja habilitada" });
+        .json({ ok: false, message: "Rol sin caja habilitada" });
+    }
 
-    // 2) Admin ejecutor
+    // 2) Admin ejecutor (actor/dueño del asiento)
     const adminUserId = req.user?._id
       ? new mongoose.Types.ObjectId(String(req.user._id))
       : null;
-    if (!adminUserId)
+
+    if (!adminUserId) {
+      await session.abortTransaction();
       return res
         .status(403)
         .json({ ok: false, message: "Sesión admin requerida" });
+    }
+
+    // ✅ NEW: resolver nombre real del admin desde DB (evita fromUser/toUser = null)
+    const adminUser = await User.findById(adminUserId)
+      .select("_id name email role")
+      .session(session)
+      .lean();
+
+    const executorName =
+      String(req.user?.name || req.user?.email || "").trim() ||
+      String(adminUser?.name || adminUser?.email || "").trim() ||
+      "ADMINISTRACIÓN";
+
+    const idCobNum = Number(cobradorUser?.idCobrador ?? idCobrador);
+    const safeIdCob = Number.isFinite(idCobNum) ? idCobNum : null;
+
+    const cobradorName =
+      String(cobradorUser?.name || cobradorUser?.email || "").trim() ||
+      (Number.isFinite(idCobNum) ? `Cobrador #${idCobNum}` : "COBRADOR");
 
     // 3) Cuentas y ventana
-    const accts =
-      String(accountCodes || "")
-        .split(",")
-        .map((s) => s.trim())
-        .filter(Boolean).length > 0
-        ? String(accountCodes)
-            .split(",")
-            .map((s) => s.trim())
-            .filter(Boolean)
-        : DEFAULT_ACCOUNTS;
+    const parsed = String(accountCodes || "")
+      .split(",")
+      .map((s) => s.trim())
+      .filter(Boolean);
 
-    const destAcct = (destAccountCode || DEST_DEFAULT).trim() || DEST_DEFAULT;
-    if (destAcct === "CAJA_COBRADOR") {
+    const accts = parsed.length > 0 ? parsed : DEFAULT_ACCOUNTS;
+
+    const destAcct =
+      String(destAccountCode || DEST_DEFAULT).trim() || DEST_DEFAULT;
+
+    if (!destAcct || destAcct === "CAJA_COBRADOR") {
+      await session.abortTransaction();
       return res
         .status(400)
         .json({ ok: false, message: "Cuenta destino inválida" });
@@ -1101,20 +916,26 @@ export async function crearArqueoUsuario(req, res, next) {
     const fromDt = parseISODate(df);
     const toDt = parseISODate(dt, true);
 
-    // 4) Saldo por moneda del cobrador (match coherente con listados)
-    const matchCollector = buildUserLedgerMatch({
-      user: cobradorUser,
-      accounts: accts,
-      fromDt,
-      toDt,
-      side: undefined,
-    });
+    // 4) Saldo por cuenta+moneda del ORIGEN
+    // ✅ NEW-ONLY: calculamos saldo de caja del cobrador por dimensions.idCobrador (no por legacy matchers)
+    const matchCollector = {
+      accountCode: { $in: accts },
+      ...(safeIdCob != null ? { "dimensions.idCobrador": safeIdCob } : {}),
+      ...(fromDt || toDt
+        ? {
+            postedAt: {
+              ...(fromDt ? { $gte: fromDt } : {}),
+              ...(toDt ? { $lte: toDt } : {}),
+            },
+          }
+        : {}),
+    };
 
-    const byCurrency = await LedgerEntry.aggregate([
+    const byAcctCurrency = await LedgerEntry.aggregate([
       { $match: matchCollector },
       {
         $group: {
-          _id: { currency: "$currency" },
+          _id: { currency: "$currency", accountCode: "$accountCode" },
           debits: debitExpr,
           credits: creditExpr,
         },
@@ -1123,109 +944,113 @@ export async function crearArqueoUsuario(req, res, next) {
         $project: {
           _id: 0,
           currency: "$_id.currency",
+          accountCode: "$_id.accountCode",
           balance: { $subtract: ["$debits", "$credits"] },
         },
       },
     ]).allowDiskUse(true);
 
-    const positives = byCurrency
+    const minAmt = Number(minAmount || 0);
+
+    const positives = (byAcctCurrency || [])
       .map((r) => ({
         currency: r.currency || "ARS",
+        accountCode: String(r.accountCode || "").trim(),
         balance: Number(r.balance || 0),
       }))
-      .filter((r) => r.balance > 0 && r.balance >= Number(minAmount || 0));
+      .filter(
+        (r) =>
+          r.accountCode &&
+          Number.isFinite(r.balance) &&
+          r.balance > 0 &&
+          r.balance >= (Number.isFinite(minAmt) ? minAmt : 0)
+      );
 
     const totalPos = positives.reduce((a, r) => a + r.balance, 0);
 
     if (!positives.length || totalPos <= 0) {
+      await session.abortTransaction();
       return res.status(409).json({
         ok: false,
         message:
           "No hay saldo positivo para transferir desde la caja del cobrador.",
-        details: { perCurrency: byCurrency },
+        details: { perAcctCurrency: byAcctCurrency },
       });
     }
 
-    // 5) Asientos idempotentes — userId correcto por línea
-    const now = new Date();
+    // 5) Escribir doble partida por cada (accountCode, currency) con saldo positivo
     const created = [];
+    const postedAt = new Date();
 
     for (const row of positives) {
-      const { currency, balance } = row;
+      const { currency, balance, accountCode } = row;
+      const amtAbs = Math.abs(Number(balance) || 0);
+      if (!(amtAbs > 0)) continue;
 
-      const idemKey = `arqueo:${String(cobradorUser._id)}:${String(
-        adminUserId
-      )}:${destAcct}:${currency}:${Math.floor(now.getTime() / 60000)}`;
+      // paymentId correlativo (no hay Payment real)
+      const paymentId = new mongoose.Types.ObjectId();
 
-      // idempotencia: chequeo en la línea destino (debit)
-      const exists = await LedgerEntry.findOne({
-        "dimensions.idemKey": idemKey,
-        accountCode: destAcct,
-        side: "debit",
-        currency,
-        userId: adminUserId,
-      }).lean();
-      if (exists) continue;
-
-      const syntheticPaymentId = new mongoose.Types.ObjectId();
-
-      const dimBase = {
-        idCobrador: Number(cobradorUser.idCobrador ?? idCobrador) ?? null,
-        performedBy: adminUserId,
-        note: note || "",
-        dateFrom: df || null,
-        dateTo: dt || null,
-        kind: "ARQUEO_MANUAL",
-        idemKey,
+      // dimensions new schema (sin performedBy/cobradorId)
+      const dims = {
+        idCobrador: safeIdCob,
+        idCliente: null,
+        plan: null,
+        canal: "ARQUEO_USUARIO",
+        note: String(note || "").trim(),
       };
 
-      // ⚠️ LÍNEA 1: CREDIT en CAJA_COBRADOR
-      // - userId = admin (ejecutor) para que el listado muestre Admin → Cobrador
-      // - vinculamos al cobrador por dimensions.idCobrador
-      const creditOut = {
-        paymentId: syntheticPaymentId,
-        userId: adminUserId, // ← clave para naming correcto
-        accountCode: "CAJA_COBRADOR",
-        side: "credit",
-        amount: balance,
-        currency,
-        postedAt: now,
-        dimensions: {
-          ...dimBase,
-          fromUserId: adminUserId, // dirección: Admin → Cobrador (vista)
-          toUserId: cobradorUser._id,
+      const docs = [
+        // ✅ DEBIT: ORIGEN -> DESTINO (cobrador -> admin)
+        {
+          paymentId,
+          userId: adminUserId, // actor/dueño (admin ejecutor) - consistente
+          kind: "ARQUEO_MANUAL",
+          side: "debit",
+          accountCode: destAcct,
+          amount: amtAbs,
+          currency,
+          postedAt,
+          fromUser: cobradorName,
+          toUser: executorName,
+          fromAccountCode: accountCode,
+          toAccountCode: destAcct,
+          dimensions: dims,
         },
-      };
 
-      // LÍNEA 2: DEBIT en cuenta destino (p.ej. CAJA_ADMIN) con userId = admin
-      const debitIn = {
-        paymentId: syntheticPaymentId,
-        userId: adminUserId,
-        accountCode: destAcct,
-        side: "debit",
-        amount: balance,
-        currency,
-        postedAt: now,
-        dimensions: {
-          ...dimBase,
-          fromUserId: cobradorUser._id, // vista: Cobrador → Admin en CAJA_ADMIN (debit)
-          toUserId: adminUserId,
+        // ✅ CREDIT: inverso (admin -> cobrador)
+        {
+          paymentId,
+          userId: adminUserId, // mismo actor/dueño
+          kind: "ARQUEO_MANUAL",
+          side: "credit",
+          accountCode: accountCode,
+          amount: amtAbs,
+          currency,
+          postedAt,
+          fromUser: executorName,
+          toUser: cobradorName,
+          fromAccountCode: destAcct,
+          toAccountCode: accountCode,
+          dimensions: dims,
         },
-      };
+      ];
 
-      const entries = await LedgerEntry.insertMany([creditOut, debitIn], {
+      const ins = await LedgerEntry.insertMany(docs, {
+        session,
         ordered: true,
       });
 
       created.push({
         currency,
-        balance,
-        from: { userId: adminUserId, accountCode: "CAJA_COBRADOR" }, // (owner lógico mostrado)
-        to: { userId: adminUserId, accountCode: destAcct },
-        paymentId: syntheticPaymentId,
-        entryIds: entries.map((e) => e._id),
+        amount: amtAbs,
+        from: { accountCode },
+        to: { accountCode: destAcct },
+        paymentId: String(paymentId),
+        entryIds: ins.map((x) => String(x._id)),
       });
     }
+
+    await session.commitTransaction();
 
     return res.status(201).json({
       ok: true,
@@ -1236,20 +1061,27 @@ export async function crearArqueoUsuario(req, res, next) {
         totalPosAntes: totalPos,
         cuentasOrigen: accts,
         cuentaDestino: destAcct,
+        ventana: { dateFrom: df || null, dateTo: dt || null },
+        cobrador: {
+          userId: String(cobradorUser._id),
+          idCobrador: safeIdCob,
+          name: cobradorName,
+        },
+        executedBy: {
+          userId: String(adminUserId),
+          name: executorName,
+        },
       },
     });
   } catch (err) {
-    next(err);
+    try {
+      await session.abortTransaction();
+    } catch {}
+    return next(err);
+  } finally {
+    session.endSession();
   }
 }
-
-/**
- * GET /api/admin/arqueos/usuarios/clientes
- * Lista de “clientes del cobrador” con estado billing (paid/due).
- * Query:
- *  - userId (resuelve idCobrador) o idCobrador directo
- *  - page, limit, q, sortBy, sortDir, full=1
- */
 export async function listArqueoUsuarioClientes(req, res, next) {
   try {
     const FULL = String(req.query.full || "") === "1";
@@ -1513,7 +1345,7 @@ export async function listArqueoUsuarioClientes(req, res, next) {
                   in: { $add: [{ $multiply: ["$$y", 100] }, "$$m"] },
                 },
               },
-              { $subtract: [NOW_NUM, 1] }, // si nunca pagó, consideramos "al mes anterior"
+              { $subtract: [NOW_NUM, 1] },
             ],
           },
         },
@@ -1540,7 +1372,7 @@ export async function listArqueoUsuarioClientes(req, res, next) {
               {
                 $or: [
                   { $gte: ["$billing.paidNow", "$billing.chargeNow"] },
-                  { $gt: ["$__maxNum", NOW_NUM] }, // tiene meses por adelantado
+                  { $gt: ["$__maxNum", NOW_NUM] },
                 ],
               },
               "paid",
@@ -1562,9 +1394,8 @@ export async function listArqueoUsuarioClientes(req, res, next) {
       ...(!FULL ? [{ $skip: (page - 1) * limit }, { $limit: limit }] : []),
     ];
 
-    // ⚠️ usar el modelo correcto: Cliente (no Client)
     const [items, totalRes] = await Promise.all([
-      Cliente.aggregate(pipeline).allowDiskUse(true), // <- antes: Client.aggregate
+      Cliente.aggregate(pipeline).allowDiskUse(true),
       Cliente.aggregate([
         { $match: matchStage },
         { $group: { _id: "$idCliente" } },
@@ -1585,12 +1416,10 @@ export async function listArqueoUsuarioClientes(req, res, next) {
       full: FULL ? 1 : 0,
     });
   } catch (err) {
-    // log útil para depurar en server
     console.error("listArqueoUsuarioClientes error:", err);
     next(err);
   }
 }
-// GET /api/admin/arqueos/usuarios/clientes-csv
 export async function exportCollectorClientsCSV(req, res, next) {
   try {
     const qUserId = String(req.query.userId || "").trim();
@@ -1648,14 +1477,11 @@ export async function exportCollectorClientsCSV(req, res, next) {
 
     // ── pipeline: TODOS los miembros del cobrador; agrupamos por grupo (idCliente)
     const rows = await Cliente.aggregate([
-      // match por cobrador (sin rol)
       {
         $match: {
           $expr: { $eq: [{ $toString: "$idCobrador" }, String(cid)] },
         },
       },
-
-      // normalizaciones + flags
       {
         $addFields: {
           __isActiveMember: {
@@ -1670,7 +1496,6 @@ export async function exportCollectorClientsCSV(req, res, next) {
               false,
             ],
           },
-          // rank: prioriza TITULAR (case-insensitive), luego integrante 0, luego el resto
           __rankTitular: {
             $cond: [
               {
@@ -1724,8 +1549,6 @@ export async function exportCollectorClientsCSV(req, res, next) {
           },
         },
       },
-
-      // ordenar para elegir representante del grupo (TITULAR primero)
       {
         $sort: {
           idCliente: 1,
@@ -1735,8 +1558,6 @@ export async function exportCollectorClientsCSV(req, res, next) {
           _id: 1,
         },
       },
-
-      // agrupar por grupo; contar activos para aplicar activeOnly
       {
         $group: {
           _id: "$idCliente",
@@ -1744,11 +1565,7 @@ export async function exportCollectorClientsCSV(req, res, next) {
           activosEnGrupo: { $sum: { $cond: ["$__isActiveMember", 1, 0] } },
         },
       },
-
-      // si activeOnly=1, quedate solo con grupos que tengan al menos 1 activo
       ...(activeOnly ? [{ $match: { activosEnGrupo: { $gt: 0 } } }] : []),
-
-      // proyección CSV
       {
         $project: {
           _id: 0,
@@ -1770,11 +1587,9 @@ export async function exportCollectorClientsCSV(req, res, next) {
           },
         },
       },
-
       { $sort: { titular: 1, idCliente: 1 } },
     ]).allowDiskUse(true);
 
-    // ── CSV
     const headers = [
       "idCliente",
       "Titular",
@@ -1827,35 +1642,52 @@ export async function exportCollectorClientsCSV(req, res, next) {
     next(err);
   }
 }
-
-/**
- * POST /api/caja/chica/deposito
- * body: { adminUserId, currency?, note? }
- * Permisos: admin (sobre sí mismo) o superAdmin (sobre cualquier admin)
- * Lógica: mueve TODO el saldo de CAJA_ADMIN → CAJA_CHICA del admin.
- */
 export async function depositoCajaChica(req, res, next) {
+  const session = await mongoose.startSession();
+  session.startTransaction();
+
   try {
     const { adminUserId, currency = "ARS", note = "" } = req.body || {};
     if (!adminUserId) {
+      await session.abortTransaction();
       return res.status(400).json({ ok: false, message: "Falta adminUserId" });
     }
 
-    const admin = await User.findById(adminUserId).select("_id role").lean();
+    const admin = await User.findById(adminUserId)
+      .select("_id role name email")
+      .session(session)
+      .lean();
+
     if (!admin || admin.role !== "admin") {
+      await session.abortTransaction();
       return res
         .status(400)
         .json({ ok: false, message: "adminUserId inválido" });
     }
 
-    // Seguridad: el propio admin o un superAdmin
-    const viewerRole = String(req.user?.role || "");
+    const viewerRole = String(req.user?.role || "").trim();
     const isSelf = String(req.user?._id) === String(admin._id);
     if (!(isSelf || viewerRole === "superAdmin")) {
+      await session.abortTransaction();
       return res.status(403).json({ ok: false, message: "Sin permisos" });
     }
 
-    // 👉 Mover TODO el saldo de CAJA_ADMIN
+    const executorOid = req.user?._id
+      ? new mongoose.Types.ObjectId(String(req.user._id))
+      : new mongoose.Types.ObjectId(String(admin._id));
+
+    const executorUser = await User.findById(executorOid)
+      .select("_id name email role")
+      .session(session)
+      .lean();
+
+    const adminName =
+      String(admin?.name || admin?.email || "").trim() || "ADMIN";
+    const executorName =
+      String(req.user?.name || req.user?.email || "").trim() ||
+      String(executorUser?.name || executorUser?.email || "").trim() ||
+      adminName;
+
     const saldoAdmin = await getBalance({
       userId: admin._id,
       accountCode: DEST_DEFAULT, // CAJA_ADMIN
@@ -1863,7 +1695,8 @@ export async function depositoCajaChica(req, res, next) {
     });
 
     const amount = Number(saldoAdmin || 0);
-    if (amount <= 0) {
+    if (!Number.isFinite(amount) || amount <= 0) {
+      await session.abortTransaction();
       return res.status(409).json({
         ok: false,
         message: "No hay saldo disponible en CAJA_ADMIN para mover.",
@@ -1871,32 +1704,93 @@ export async function depositoCajaChica(req, res, next) {
       });
     }
 
-    const out = await createLedgerTransfer({
-      from: { userId: admin._id, accountCode: DEST_DEFAULT }, // CAJA_ADMIN
-      to: { userId: admin._id, accountCode: CAJA_CHICA },
-      amount,
-      currency,
+    const postedAt = new Date();
+    const amtAbs = Math.abs(amount);
+    const paymentId = new mongoose.Types.ObjectId();
+
+    const dims = {
+      idCobrador: null,
+      idCliente: null,
+      plan: null,
+      canal: "CAJA_ADMIN->CAJA_CHICA",
+      note: String(note || "").trim(),
+      executedByUserId: String(executorOid),
+      executedByName: executorName,
+    };
+
+    // Dirección real del movimiento
+    const realFromAccount = DEST_DEFAULT; // CAJA_ADMIN (usuario)
+    const realToAccount = CAJA_CHICA; // caja física
+
+    // ✅ DEBIT: entra a CAJA_CHICA (dueño = CAJA_CHICA)
+    const debitDoc = {
+      paymentId,
+      userId: new mongoose.Types.ObjectId(String(admin._id)), // custodio (tu esquema)
       kind: "CAJA_CHICA_DEPOSITO_ALL",
-      note,
-      idemScope: `ALL:${admin._id}`,
-      extraDims: { performedBy: req.user?._id || null },
+      side: "debit",
+      accountCode: CAJA_CHICA,
+      amount: amtAbs,
+      currency,
+      postedAt,
+
+      fromUser: adminName,
+      toUser: "CAJA_CHICA",
+      fromAccountCode: realFromAccount,
+      toAccountCode: realToAccount,
+
+      dimensions: dims,
+    };
+
+    // ✅ CREDIT: sale de CAJA_ADMIN (dueño = ADMIN) => INVERTIMOS para que toUser sea el dueño
+    const creditDoc = {
+      paymentId,
+      userId: new mongoose.Types.ObjectId(String(admin._id)),
+      kind: "CAJA_CHICA_DEPOSITO_ALL",
+      side: "credit",
+      accountCode: DEST_DEFAULT, // CAJA_ADMIN
+      amount: amtAbs,
+      currency,
+      postedAt,
+
+      fromUser: "CAJA_CHICA",
+      toUser: adminName,
+      fromAccountCode: CAJA_CHICA,
+      toAccountCode: DEST_DEFAULT,
+
+      dimensions: dims,
+    };
+
+    const ins = await LedgerEntry.insertMany([debitDoc, creditDoc], {
+      session,
+      ordered: true,
     });
 
-    return res.status(201).json({ ok: true, movedAll: true, amount, ...out });
+    await session.commitTransaction();
+    return res.status(201).json({
+      ok: true,
+      movedAll: true,
+      amount: amtAbs,
+      currency,
+      paymentId: String(paymentId),
+      entryIds: ins.map((x) => String(x._id)),
+      executedBy: { userId: String(executorOid), name: executorName },
+    });
   } catch (err) {
-    next(err);
+    try {
+      await session.abortTransaction();
+    } catch {}
+    return next(err);
+  } finally {
+    session.endSession();
   }
 }
-
-/**
- * POST /api/caja/grande/ingreso
- * body: { amount?, moveAll?, currency="ARS", toSuperAdminUserId? }
- * Permisos: sólo superAdmin
- * Lógica: desde CAJA_CHICA (GLOBAL) → CAJA_GRANDE (del SA). Monto o TODO.
- */
 export async function ingresoCajaGrande(req, res, next) {
+  const session = await mongoose.startSession();
+  session.startTransaction();
+
   try {
-    if (String(req.user?.role || "") !== "superAdmin") {
+    if (String(req.user?.role || "").trim() !== "superAdmin") {
+      await session.abortTransaction();
       return res.status(403).json({ ok: false, message: "Sólo superAdmin" });
     }
 
@@ -1908,29 +1802,69 @@ export async function ingresoCajaGrande(req, res, next) {
       note = "",
     } = req.body || {};
 
-    // Dueño de la bóveda (CAJA_GRANDE)
     const vaultOwnerId = toSuperAdminUserId || req.user._id;
-    const sa = await User.findById(vaultOwnerId).select("_id role").lean();
+
+    const sa = await User.findById(vaultOwnerId)
+      .select("_id role name email")
+      .session(session)
+      .lean();
+
     if (!sa || sa.role !== "superAdmin") {
+      await session.abortTransaction();
       return res
         .status(400)
         .json({ ok: false, message: "toSuperAdminUserId inválido" });
     }
 
-    // 1) Sumar CHICA como GLOBAL: por accountCode+currency, sin filtrar userId
-    const byAdmin = await LedgerEntry.aggregate([
+    const executorOid = new mongoose.Types.ObjectId(String(req.user._id));
+    const executorUser = await User.findById(executorOid)
+      .select("_id name email role")
+      .session(session)
+      .lean();
+
+    const executorName =
+      String(req.user?.name || req.user?.email || "").trim() ||
+      String(executorUser?.name || executorUser?.email || "").trim() ||
+      "SUPERADMIN";
+
+    const saName = String(sa?.name || sa?.email || "").trim() || "SUPERADMIN";
+
+    // 1) balances por userId en CAJA_CHICA (por moneda)
+    const byUser = await LedgerEntry.aggregate([
       { $match: { accountCode: CAJA_CHICA, currency } },
       { $group: { _id: "$userId", debits: debitExpr, credits: creditExpr } },
       {
         $project: {
-          userId: "$_id",
           _id: 0,
+          userId: "$_id",
           balance: { $subtract: ["$debits", "$credits"] },
         },
       },
       { $match: { balance: { $gt: 0 } } },
-      { $sort: { balance: -1 } }, // dreno simple: primero el que más tiene
-    ]);
+      { $sort: { balance: -1 } },
+    ]).allowDiskUse(true);
+
+    if (!byUser.length) {
+      await session.abortTransaction();
+      return res.status(409).json({
+        ok: false,
+        message: "No hay saldo disponible en CAJA_CHICA (GLOBAL) para mover.",
+        available: 0,
+      });
+    }
+
+    // 1.1) solo admins
+    const userIds = byUser.map((x) => x.userId).filter(Boolean);
+
+    const admins = await User.find({ _id: { $in: userIds }, role: "admin" })
+      .select("_id name email role")
+      .session(session)
+      .lean();
+
+    const adminIdSet = new Set((admins || []).map((u) => String(u._id)));
+    const byAdmin = (byUser || []).filter((it) =>
+      adminIdSet.has(String(it.userId))
+    );
 
     const totalAvailable = byAdmin.reduce(
       (acc, it) => acc + Number(it.balance || 0),
@@ -1941,7 +1875,8 @@ export async function ingresoCajaGrande(req, res, next) {
     const wantAll = String(moveAll || "") === "1" || !Number(requested);
     if (wantAll) requested = totalAvailable;
 
-    if (!Number.isFinite(requested) || requested <= 0) {
+    if (!Number.isFinite(requested) || requested <= 0 || totalAvailable <= 0) {
+      await session.abortTransaction();
       return res.status(409).json({
         ok: false,
         message: "No hay saldo disponible en CAJA_CHICA (GLOBAL) para mover.",
@@ -1949,39 +1884,100 @@ export async function ingresoCajaGrande(req, res, next) {
         requestedAll: wantAll ? 1 : 0,
       });
     }
+
     if (requested > totalAvailable + 1e-9) {
+      await session.abortTransaction();
       return res.status(409).json({
         ok: false,
-        message: `El monto solicitado excede el saldo en CAJA_CHICA (GLOBAL).`,
+        message: "El monto solicitado excede el saldo en CAJA_CHICA (GLOBAL).",
         available: totalAvailable,
         requested,
       });
     }
 
-    // 2) Transferir CHICA(admin) -> GRANDE(SA) hasta cubrir 'requested'
+    // 2) Transferir CHICA(admin) -> GRANDE(SA)
     let remaining = requested;
-    const transfers = []; // no exponemos nombres; sólo guardamos ids/montos si querés audit
+    const transfers = [];
+    const postedAt = new Date();
+
     for (const it of byAdmin) {
       if (remaining <= 0) break;
-      const move = Math.min(remaining, Number(it.balance || 0));
-      if (move <= 0) continue;
 
-      const out = await createLedgerTransfer({
-        from: { userId: it.userId, accountCode: CAJA_CHICA },
-        to: { userId: sa._id, accountCode: CAJA_GRANDE },
-        amount: move,
-        currency,
+      const ownerId = it.userId; // admin dueño de esa caja chica
+      const ownerIdStr = String(ownerId);
+
+      const move = Math.min(remaining, Number(it.balance || 0));
+      if (!Number.isFinite(move) || move <= 0) continue;
+
+      const amtAbs = Math.abs(move);
+      const paymentId = new mongoose.Types.ObjectId();
+
+      const dims = {
+        idCobrador: null,
+        idCliente: null,
+        plan: null,
+        canal: "CAJA_CHICA->CAJA_GRANDE",
+        note: String(note || "").trim(),
+        fromAdminUserId: ownerIdStr,
+        executedByUserId: String(executorOid),
+        executedByName: executorName,
+      };
+
+      // ✅ DEBIT: entra a CAJA_GRANDE (dueño = CAJA_GRANDE)
+      const debitDoc = {
+        paymentId,
+        userId: new mongoose.Types.ObjectId(String(sa._id)), // custodio del “vault”
         kind: wantAll ? "CAJA_GRANDE_INGRESO_ALL" : "CAJA_GRANDE_INGRESO",
-        note,
-        extraDims: { performedBy: req.user._id, scope: "GLOBAL_CHICA" },
-        idemScope: `CHICA_AGREGADA->GRANDE:${String(
-          sa._id
-        )}:${currency}:${move}:${String(it.userId)}`,
+        side: "debit",
+        accountCode: CAJA_GRANDE,
+        amount: amtAbs,
+        currency,
+        postedAt,
+
+        fromUser: "CAJA_CHICA",
+        toUser: "CAJA_GRANDE",
+        fromAccountCode: CAJA_CHICA,
+        toAccountCode: CAJA_GRANDE,
+
+        dimensions: dims,
+      };
+
+      // ✅ CREDIT: sale de CAJA_CHICA (dueño = CAJA_CHICA) => INVERTIMOS para que toUser sea el dueño
+      const creditDoc = {
+        paymentId,
+        userId: new mongoose.Types.ObjectId(String(ownerId)), // de dónde salió (por tu esquema)
+        kind: wantAll ? "CAJA_GRANDE_INGRESO_ALL" : "CAJA_GRANDE_INGRESO",
+        side: "credit",
+        accountCode: CAJA_CHICA,
+        amount: amtAbs,
+        currency,
+        postedAt,
+
+        fromUser: "CAJA_GRANDE",
+        toUser: "CAJA_CHICA",
+        fromAccountCode: CAJA_GRANDE,
+        toAccountCode: CAJA_CHICA,
+
+        dimensions: dims,
+      };
+
+      const ins = await LedgerEntry.insertMany([debitDoc, creditDoc], {
+        session,
+        ordered: true,
       });
 
-      transfers.push({ moved: move, id: out?.id || null });
-      remaining -= move;
+      transfers.push({
+        moved: amtAbs,
+        fromAdminUserId: ownerIdStr,
+        toSuperAdminUserId: String(sa._id),
+        paymentId: String(paymentId),
+        entryIds: ins.map((x) => String(x._id)),
+      });
+
+      remaining -= amtAbs;
     }
+
+    await session.commitTransaction();
 
     return res.status(201).json({
       ok: true,
@@ -1989,22 +1985,28 @@ export async function ingresoCajaGrande(req, res, next) {
       amount: requested,
       currency,
       transfersCount: transfers.length,
+      requestedAll: wantAll ? 1 : 0,
+      available: totalAvailable,
+      transfers,
+      executedBy: { userId: String(executorOid), name: executorName },
     });
   } catch (err) {
-    next(err);
+    try {
+      await session.abortTransaction();
+    } catch {}
+    return next(err);
+  } finally {
+    session.endSession();
   }
 }
-
-/**
- * POST /api/caja/grande/extraccion
- * body: { amount?, moveAll?, currency?, note?, superAdminUserId? }
- * Permisos: sólo superAdmin
- * Lógica: si moveAll=1 (o no se pasa amount), mueve TODO desde CAJA_GRANDE → CAJA_SUPERADMIN del SA.
- */
 export async function extraccionCajaGrande(req, res, next) {
+  const session = await mongoose.startSession();
+  session.startTransaction();
+
   try {
-    const role = String(req.user?.role || "");
+    const role = String(req.user?.role || "").trim();
     if (role !== "superAdmin") {
+      await session.abortTransaction();
       return res.status(403).json({ ok: false, message: "Sólo superAdmin" });
     }
 
@@ -2017,12 +2019,31 @@ export async function extraccionCajaGrande(req, res, next) {
     } = req.body || {};
 
     const ownerId = superAdminUserId || req.user._id;
-    const sa = await User.findById(ownerId).select("_id role").lean();
+
+    const sa = await User.findById(ownerId)
+      .select("_id role name email")
+      .session(session)
+      .lean();
+
     if (!sa || sa.role !== "superAdmin") {
+      await session.abortTransaction();
       return res
         .status(400)
         .json({ ok: false, message: "superAdminUserId inválido" });
     }
+
+    const executorOid = new mongoose.Types.ObjectId(String(req.user._id));
+    const executorUser = await User.findById(executorOid)
+      .select("_id name email role")
+      .session(session)
+      .lean();
+
+    const executorName =
+      String(req.user?.name || req.user?.email || "").trim() ||
+      String(executorUser?.name || executorUser?.email || "").trim() ||
+      "SUPERADMIN";
+
+    const saName = String(sa?.name || sa?.email || "").trim() || "SUPERADMIN";
 
     let amount = Number(amountRaw);
     const shouldMoveAll = String(moveAll || "") === "1" || !Number(amount);
@@ -2037,6 +2058,7 @@ export async function extraccionCajaGrande(req, res, next) {
     }
 
     if (!Number.isFinite(amount) || amount <= 0) {
+      await session.abortTransaction();
       return res.status(409).json({
         ok: false,
         message: "No hay saldo disponible en CAJA_GRANDE para extraer.",
@@ -2044,42 +2066,96 @@ export async function extraccionCajaGrande(req, res, next) {
       });
     }
 
-    const out = await createLedgerTransfer({
-      from: { userId: sa._id, accountCode: CAJA_GRANDE },
-      to: { userId: sa._id, accountCode: CAJA_SUPERADMIN },
-      amount,
-      currency,
+    const postedAt = new Date();
+    const amtAbs = Math.abs(amount);
+    const paymentId = new mongoose.Types.ObjectId();
+
+    const dims = {
+      idCobrador: null,
+      idCliente: null,
+      plan: null,
+      canal: "CAJA_GRANDE->CAJA_SUPERADMIN",
+      note: String(note || "").trim(),
+      executedByUserId: String(executorOid),
+      executedByName: executorName,
+    };
+
+    // ✅ DEBIT: entra al usuario (dueño = SA)
+    const debitDoc = {
+      paymentId,
+      userId: new mongoose.Types.ObjectId(String(sa._id)),
       kind: shouldMoveAll
         ? "CAJA_GRANDE_EXTRACCION_ALL"
         : "CAJA_GRANDE_EXTRACCION",
-      note,
-      extraDims: { performedBy: req.user._id },
-      idemScope: `${shouldMoveAll ? "ALL:" : ""}${sa._id}`,
+      side: "debit",
+      accountCode: CAJA_SUPERADMIN,
+      amount: amtAbs,
+      currency,
+      postedAt,
+
+      fromUser: "CAJA_GRANDE",
+      toUser: saName,
+      fromAccountCode: CAJA_GRANDE,
+      toAccountCode: CAJA_SUPERADMIN,
+
+      dimensions: dims,
+    };
+
+    // ✅ CREDIT: sale de CAJA_GRANDE (dueño = CAJA_GRANDE) => INVERTIMOS para que toUser sea el dueño
+    const creditDoc = {
+      paymentId,
+      userId: new mongoose.Types.ObjectId(String(sa._id)),
+      kind: shouldMoveAll
+        ? "CAJA_GRANDE_EXTRACCION_ALL"
+        : "CAJA_GRANDE_EXTRACCION",
+      side: "credit",
+      accountCode: CAJA_GRANDE,
+      amount: amtAbs,
+      currency,
+      postedAt,
+
+      fromUser: saName,
+      toUser: "CAJA_GRANDE",
+      fromAccountCode: CAJA_SUPERADMIN,
+      toAccountCode: CAJA_GRANDE,
+
+      dimensions: dims,
+    };
+
+    const ins = await LedgerEntry.insertMany([debitDoc, creditDoc], {
+      session,
+      ordered: true,
     });
+
+    await session.commitTransaction();
 
     return res.status(201).json({
       ok: true,
-      movedAll: shouldMoveAll ? true : false,
-      amount,
-      ...out,
+      movedAll: !!shouldMoveAll,
+      amount: amtAbs,
+      currency,
+      paymentId: String(paymentId),
+      entryIds: ins.map((x) => String(x._id)),
+      executedBy: { userId: String(executorOid), name: executorName },
     });
   } catch (err) {
-    next(err);
+    try {
+      await session.abortTransaction();
+    } catch {}
+    return next(err);
+  } finally {
+    session.endSession();
   }
 }
-
 export async function getGlobalCajasBalance(req, res, next) {
   try {
-    // Sólo superAdmin puede ver globales
-    if (String(req.user?.role || "") !== "superAdmin") {
+    if (String(req.user?.role || "").trim() !== "superAdmin") {
       return res.status(403).json({ ok: false, message: "Sólo superAdmin" });
     }
 
     const fromDt = parseISODate(req.query.dateFrom);
     const toDt = parseISODate(req.query.dateTo, true);
 
-    // CAJA_GRANDE global = todas las entradas con accountCode CAJA_GRANDE (cualquier userId)
-    // CAJA_CHICA  global = todas las entradas con accountCode CAJA_CHICA  (cualquier userId)
     const matchBase = (acc) => ({
       accountCode: acc,
       ...(fromDt || toDt
@@ -2099,14 +2175,14 @@ export async function getGlobalCajasBalance(req, res, next) {
         {
           $project: { _id: 0, balance: { $subtract: ["$debits", "$credits"] } },
         },
-      ]),
+      ]).allowDiskUse(true),
       LedgerEntry.aggregate([
         { $match: matchBase(CAJA_CHICA) },
         { $group: { _id: null, debits: debitExpr, credits: creditExpr } },
         {
           $project: { _id: 0, balance: { $subtract: ["$debits", "$credits"] } },
         },
-      ]),
+      ]).allowDiskUse(true),
     ]);
 
     const balances = {
@@ -2173,7 +2249,7 @@ export async function getArqueoGlobalTotals(req, res, next) {
           paymentsCount: { $size: "$paymentsSet" },
         },
       },
-    ]);
+    ]).allowDiskUse(true);
 
     res.json({
       ok: true,
@@ -2194,17 +2270,16 @@ export async function getArqueoGlobalTotals(req, res, next) {
     next(err);
   }
 }
-
 export async function getCollectorCommissionSummaryAdmin(req, res) {
   try {
     const {
-      userId, // _id Mongo del cobrador (User)
-      idCobrador, // opcional: idCobrador numérico
-      dateFrom, // opcional: YYYY-MM-DD
-      dateTo, // opcional: YYYY-MM-DD
+      userId,
+      idCobrador,
+      dateFrom,
+      dateTo,
+      currency = "ARS", // CAMBIO: asegurar resumen por moneda (evita mezclar ARS/USD)
     } = req.query;
 
-    // ───────────────────────── Seguridad básica ─────────────────────────
     const viewerRole = String(req.user?.role || "").trim();
     if (!["admin", "superAdmin"].includes(viewerRole)) {
       return res.status(403).json({
@@ -2213,23 +2288,13 @@ export async function getCollectorCommissionSummaryAdmin(req, res) {
       });
     }
 
-    // Helper local para días entre fechas (A → B, en enteros)
-    const diffInDays = (from, to) => {
-      if (!from || !to) return 0;
-      const a = new Date(from);
-      const b = new Date(to);
-      if (Number.isNaN(a.getTime()) || Number.isNaN(b.getTime())) return 0;
-      const ms = b.getTime() - a.getTime();
-      return Math.max(0, Math.floor(ms / (1000 * 60 * 60 * 24)));
-    };
-
-    // ───────────────────────── Buscar cobrador ─────────────────────────
+    // ───────────────── Buscar cobrador ─────────────────
     let collectorUser = null;
 
     if (userId && isObjectIdLike(userId)) {
       collectorUser = await User.findById(userId)
         .select(
-          "name email role idCobrador porcentajeCobrador commissionGraceDays commissionPenaltyPerDay"
+          "_id name email role idCobrador porcentajeCobrador commissionGraceDays commissionPenaltyPerDay"
         )
         .lean();
     } else if (idCobrador != null) {
@@ -2239,17 +2304,25 @@ export async function getCollectorCommissionSummaryAdmin(req, res) {
         idCobrador: idCobStr,
       })
         .select(
-          "name email role idCobrador porcentajeCobrador commissionGraceDays commissionPenaltyPerDay"
+          "_id name email role idCobrador porcentajeCobrador commissionGraceDays commissionPenaltyPerDay"
         )
         .lean();
     }
 
     if (!collectorUser) {
-      return res.status(404).json({
-        ok: false,
-        message: "No se encontró el cobrador indicado.",
-      });
+      return res
+        .status(404)
+        .json({ ok: false, message: "No se encontró el cobrador indicado." });
     }
+
+    if (collectorUser.role !== "cobrador") {
+      return res
+        .status(400)
+        .json({ ok: false, message: "El usuario indicado no es cobrador." });
+    }
+
+    const collectorOid = new mongoose.Types.ObjectId(String(collectorUser._id));
+    const collectorOidStr = String(collectorOid);
 
     const myCollectorId = Number(collectorUser.idCobrador);
     if (!Number.isFinite(myCollectorId) || myCollectorId <= 0) {
@@ -2259,21 +2332,19 @@ export async function getCollectorCommissionSummaryAdmin(req, res) {
       });
     }
 
-    // ─────────────────────── Rango de fechas / período ───────────────────────
+    // ───────────────── Rango fechas / período ─────────────────
     const now = new Date();
 
     let rangeStart = normalizeDateStart(dateFrom);
     let rangeEnd = normalizeDateEnd(dateTo);
 
-    // Si no mandan rango, usamos el mes actual
     if (!rangeStart || !rangeEnd) {
-      const yearNow = now.getFullYear();
-      const monthNow = now.getMonth(); // 0–11
-      rangeStart = new Date(yearNow, monthNow, 1, 0, 0, 0, 0);
-      rangeEnd = new Date(yearNow, monthNow + 1, 0, 23, 59, 59, 999);
+      const y = now.getFullYear();
+      const m = now.getMonth();
+      rangeStart = new Date(y, m, 1, 0, 0, 0, 0);
+      rangeEnd = new Date(y, m + 1, 0, 23, 59, 59, 999);
     }
 
-    // El "period" lo tomamos del inicio del rango (YYYY-MM)
     const period = yyyymmAR(rangeStart);
     const year = rangeStart.getFullYear();
     const month = rangeStart.getMonth();
@@ -2282,7 +2353,6 @@ export async function getCollectorCommissionSummaryAdmin(req, res) {
       (c) => c.toUpperCase()
     );
 
-    // Días del calendario del período (NO es crítico, pero ayuda en UI)
     const daysInPeriod = new Date(year, month + 1, 0).getDate();
     const daysElapsed =
       now.getFullYear() === year && now.getMonth() === month
@@ -2290,32 +2360,27 @@ export async function getCollectorCommissionSummaryAdmin(req, res) {
         : daysInPeriod;
     const daysRemaining = Math.max(daysInPeriod - daysElapsed, 0);
 
-    // Días hábiles (lun–sáb)
     const countWorkingDays = () => {
       let total = 0;
       let elapsed = 0;
 
       for (let d = 1; d <= daysInPeriod; d++) {
         const dt = new Date(year, month, d);
-        const day = dt.getDay(); // 0 = dom, 1 = lun, ..., 6 = sáb
-        const isWorking = day >= 1 && day <= 6; // lun–sáb
-
+        const day = dt.getDay();
+        const isWorking = day >= 1 && day <= 6;
         if (!isWorking) continue;
-        total++;
 
+        total++;
         if (
           now.getFullYear() === year &&
           now.getMonth() === month &&
           d <= now.getDate()
-        ) {
+        )
           elapsed++;
-        } else if (now.getFullYear() > year || now.getMonth() > month) {
-          // período ya pasó por completo
+        else if (now.getFullYear() > year || now.getMonth() > month)
           elapsed = total;
-        }
       }
-      const remaining = Math.max(total - elapsed, 0);
-      return { total, elapsed, remaining };
+      return { total, elapsed, remaining: Math.max(total - elapsed, 0) };
     };
 
     const {
@@ -2324,20 +2389,18 @@ export async function getCollectorCommissionSummaryAdmin(req, res) {
       remaining: workingDaysRemaining,
     } = countWorkingDays();
 
-    // ───────────────────── Config de comisión (User) ─────────────────────
-    let baseCommissionRate = 0; // decimal (0.05 = 5 %)
+    // ───────────────── Config comisión ─────────────────
+    let baseCommissionRate = 0;
     let graceDays = 7;
     let penaltyPerDay = 0;
 
     const rawPercent = collectorUser.porcentajeCobrador;
     if (typeof rawPercent === "number" && rawPercent > 0) {
-      // Soporta 5 o 0.05
       baseCommissionRate = rawPercent <= 1 ? rawPercent : rawPercent / 100;
     }
 
     if (
-      collectorUser &&
-      collectorUser.commissionGraceDays != null &&
+      collectorUser?.commissionGraceDays != null &&
       Number.isFinite(Number(collectorUser.commissionGraceDays))
     ) {
       graceDays = Number(collectorUser.commissionGraceDays);
@@ -2345,14 +2408,19 @@ export async function getCollectorCommissionSummaryAdmin(req, res) {
 
     const rawPenalty = collectorUser.commissionPenaltyPerDay;
     if (typeof rawPenalty === "number" && rawPenalty > 0) {
-      // Soporta 0.1 = 10% de la TASA por día, o 10 = 10% también
       penaltyPerDay = rawPenalty <= 1 ? rawPenalty : rawPenalty / 100;
     }
 
-    // ───────────────── Clientes asignados + cuota vigente ─────────────────
+    // ───────────────── Clientes asignados + cuota vigente (esperado) ─────────────────
     const clientsAgg = await Cliente.aggregate([
-      { $match: { idCobrador: myCollectorId } },
-
+      {
+        $match: {
+          $or: [
+            { idCobrador: myCollectorId },
+            { idCobrador: String(myCollectorId) },
+          ],
+        },
+      },
       {
         $addFields: {
           createdAtSafe: { $ifNull: ["$createdAt", { $toDate: "$_id" }] },
@@ -2389,7 +2457,6 @@ export async function getCollectorCommissionSummaryAdmin(req, res) {
           },
         },
       },
-
       {
         $sort: {
           idCliente: 1,
@@ -2399,7 +2466,6 @@ export async function getCollectorCommissionSummaryAdmin(req, res) {
           _id: 1,
         },
       },
-
       {
         $group: {
           _id: "$idCliente",
@@ -2408,9 +2474,7 @@ export async function getCollectorCommissionSummaryAdmin(req, res) {
           isActive: { $max: "$__isActive" },
         },
       },
-
       { $match: { isActive: true } },
-
       {
         $group: {
           _id: null,
@@ -2423,83 +2487,43 @@ export async function getCollectorCommissionSummaryAdmin(req, res) {
     const assignedClients = clientsAgg?.[0]?.assignedClients || 0;
     const totalChargeNow = clientsAgg?.[0]?.totalChargeNow || 0;
 
-    // ───────────────── Pagos del período + comisión pago a pago ─────────────────
-    const paymentsAgg = await Payment.aggregate([
+    // ───────────────── Movimientos cliente → cobrador (base real) ─────────────────
+    // ✅ NUEVO ESQUEMA: lo que ENTRA a la caja del cobrador = CAJA_COBRADOR debit por userId del cobrador
+    const ledgerAgg = await LedgerEntry.aggregate([
       {
         $match: {
-          "collector.idCobrador": myCollectorId,
-          status: { $in: ["posted", "settled"] },
-          $expr: {
-            $and: [
-              {
-                $gte: [{ $ifNull: ["$postedAt", "$createdAt"] }, rangeStart],
-              },
-              { $lte: [{ $ifNull: ["$postedAt", "$createdAt"] }, rangeEnd] },
-            ],
-          },
-        },
-      },
-      { $unwind: "$allocations" },
-      {
-        $match: {
-          "allocations.period": period, // solo lo imputado a este período
+          accountCode: "CAJA_COBRADOR",
+          side: "debit",
+          userId: collectorOid,
+          currency, // CAMBIO: filtrar por moneda
+          "dimensions.idCliente": { $exists: true, $ne: null },
+          postedAt: { $gte: rangeStart, $lte: rangeEnd },
         },
       },
       {
-        $project: {
-          _id: 1,
-          // Fecha BASE para calcular la antigüedad del pago:
-          // usamos createdAt explícitamente (lo que vos pediste),
-          // y dejamos postedAt por si en algún momento lo necesitás en UI.
-          paymentDate: "$createdAt",
-          postedAt: { $ifNull: ["$postedAt", "$createdAt"] },
-          amountApplied: "$allocations.amountApplied",
-          "cliente.idCliente": 1,
+        $addFields: {
+          __dt: { $ifNull: ["$postedAt", "$createdAt"] },
+          __pid: { $ifNull: ["$paymentId", "$_id"] },
+        },
+      },
+      {
+        $group: {
+          _id: "$__pid",
+          amount: { $sum: "$amount" },
+          collectedAt: { $min: "$__dt" },
+          clients: { $addToSet: "$dimensions.idCliente" },
         },
       },
     ]).allowDiskUse(true);
 
+    const totalCollectedThisPeriod = (ledgerAgg || []).reduce(
+      (s, r) => s + Number(r?.amount || 0),
+      0
+    );
+
     const clientsSet = new Set();
-    let totalCollectedThisPeriod = 0;
-    let totalCommissionIdeal = 0; // sin penalidad
-    let totalCommissionDiscounted = 0; // con penalidad pago a pago
-
-    for (const p of paymentsAgg) {
-      const clientId = p.cliente?.idCliente;
-      if (clientId != null) clientsSet.add(clientId);
-
-      const applied = Number(p.amountApplied) || 0;
-      totalCollectedThisPeriod += applied;
-
-      const idealRate = baseCommissionRate;
-      const idealCommission = applied * idealRate;
-      totalCommissionIdeal += idealCommission;
-
-      // ── Cálculo del % efectivo para ESTE pago ──
-      let effectiveRate = idealRate;
-
-      if (idealRate > 0 && penaltyPerDay > 0) {
-        const baseDate = p.paymentDate || p.postedAt || null; // createdAt como prioridad
-        if (baseDate) {
-          const daysHeld = diffInDays(baseDate, now);
-
-          if (daysHeld > graceDays) {
-            const extraDays = daysHeld - graceDays;
-
-            // penaltyPerDay = % de la TASA por día
-            // ej: tasa 5% (0.05), penaltyPerDay 0.1 = 10% de la tasa/día:
-            //   día 1 después de gracia → factor = 1 - 0.1 = 0.9 → 4.5%
-            //   día 2 después de gracia → factor = 1 - 0.2 = 0.8 → 4.0%
-            const reductionFactor = penaltyPerDay * extraDays;
-            const effectiveFactor = Math.max(0, 1 - reductionFactor);
-
-            effectiveRate = idealRate * effectiveFactor;
-          }
-        }
-      }
-
-      const discountedCommission = applied * effectiveRate;
-      totalCommissionDiscounted += discountedCommission;
+    for (const r of ledgerAgg || []) {
+      for (const c of r?.clients || []) clientsSet.add(String(c));
     }
 
     const clientsWithPayment = clientsSet.size;
@@ -2508,67 +2532,103 @@ export async function getCollectorCommissionSummaryAdmin(req, res) {
       0
     );
 
-    // ───────────────── Saldo actual en mano del cobrador (caja) ─────────────────
+    // ───────────────── Saldo actual en mano del cobrador ─────────────────
     const cashAccounts = ["CAJA_COBRADOR", "A_RENDIR_COBRADOR"];
 
     const balanceAgg = await LedgerEntry.aggregate([
       {
         $match: {
-          "dimensions.idCobrador": myCollectorId,
+          userId: collectorOid,
           accountCode: { $in: cashAccounts },
+          currency, // CAMBIO: filtrar por moneda
         },
       },
       {
         $group: {
           _id: null,
-          debits: {
-            $sum: {
-              $cond: [{ $eq: ["$side", "debit"] }, "$amount", 0],
-            },
-          },
-          credits: {
-            $sum: {
-              $cond: [{ $eq: ["$side", "credit"] }, "$amount", 0],
-            },
-          },
+          debits: debitExpr,
+          credits: creditExpr,
+        },
+      },
+      {
+        $project: {
+          _id: 0,
+          balance: { $subtract: ["$debits", "$credits"] },
         },
       },
     ]).allowDiskUse(true);
 
-    const debits = balanceAgg?.[0]?.debits || 0;
-    const credits = balanceAgg?.[0]?.credits || 0;
-    const collectorBalance = debits - credits;
+    const collectorBalance = Number(balanceAgg?.[0]?.balance || 0);
 
-    // ───────────────── Comisiones globales ─────────────────
-    const expectedCommission = totalChargeNow * baseCommissionRate; // si cobrara toda la cartera al % completo
-    const currentCommission = totalCommissionDiscounted; // con penalidad pago por pago
+    // ───────────────── Comisiones (NUEVO) ─────────────────
+    const expectedCommission = totalChargeNow * baseCommissionRate;
+    const totalCommissionNoPenalty =
+      totalCollectedThisPeriod * baseCommissionRate;
 
-    // ───────────────── Lo ya pagado como comisión (ledger) ─────────────────
+    let totalCommission = 0;
+    let totalPenaltyDaysApplied = 0;
+    let avgEffectiveRate = baseCommissionRate;
+
+    if (ledgerAgg?.length) {
+      let weightedRateSum = 0;
+      let weightedAmountSum = 0;
+
+      for (const p of ledgerAgg) {
+        const amt = Number(p?.amount || 0);
+        const dt = p?.collectedAt ? new Date(p.collectedAt) : null;
+
+        if (!amt || !dt || Number.isNaN(dt.getTime())) continue;
+
+        const daysSince = diffInDays(dt, now);
+        const penaltyDays = Math.max(
+          0,
+          Number(daysSince) - Number(graceDays || 0)
+        );
+        const effectiveRate = Math.max(
+          0,
+          baseCommissionRate - penaltyPerDay * penaltyDays
+        );
+
+        totalPenaltyDaysApplied += penaltyDays;
+        totalCommission += amt * effectiveRate;
+
+        weightedRateSum += effectiveRate * amt;
+        weightedAmountSum += amt;
+      }
+
+      avgEffectiveRate =
+        weightedAmountSum > 0
+          ? weightedRateSum / weightedAmountSum
+          : baseCommissionRate;
+    }
+
+    // ───────────────── Lo ya abonado (NUEVO) ─────────────────
+    // ✅ FIX: ya NO existe dimensions.kind → usamos kind ROOT
     const paidAgg = await LedgerEntry.aggregate([
       {
         $match: {
-          kind: "commission_payout",
-          "dimensions.idCobrador": myCollectorId,
-          $expr: {
-            $and: [
-              { $gte: ["$postedAt", rangeStart] },
-              { $lte: ["$postedAt", rangeEnd] },
-            ],
-          },
+          accountCode: "COMISION_COBRADOR",
+          side: "debit",
+          userId: collectorOid,
+          currency, // CAMBIO: filtrar por moneda
+          kind: "commission_payout", // FIX
+          postedAt: { $gte: rangeStart, $lte: rangeEnd },
         },
       },
-      {
-        $group: {
-          _id: null,
-          totalPaid: { $sum: "$amount" },
-        },
-      },
+      { $group: { _id: null, totalPaid: { $sum: "$amount" } } },
     ]).allowDiskUse(true);
 
-    const alreadyPaid = paidAgg?.[0]?.totalPaid || 0;
-    const pendingCommission = Math.max(currentCommission - alreadyPaid, 0);
+    const alreadyPaid = Number(paidAgg?.[0]?.totalPaid || 0);
+    const pendingCommission = Math.max(totalCommission - alreadyPaid, 0);
 
-    // ───────────────── Respuesta ─────────────────
+    const rootAmounts = {
+      expectedCommission,
+      totalCommission,
+      totalCommissionNoPenalty,
+      alreadyPaid,
+      pendingCommission,
+    };
+
     return res.json({
       ok: true,
       data: {
@@ -2579,7 +2639,7 @@ export async function getCollectorCommissionSummaryAdmin(req, res) {
           idCobrador: myCollectorId,
         },
         month: {
-          period, // "YYYY-MM"
+          period,
           label,
           daysInPeriod,
           daysElapsed,
@@ -2592,22 +2652,28 @@ export async function getCollectorCommissionSummaryAdmin(req, res) {
           clientsWithPayment,
           clientsWithoutPayment,
         },
-        balance: {
-          collectorBalance,
-        },
+        balance: { collectorBalance },
+
+        amounts: rootAmounts,
+
         commissions: {
           config: {
-            basePercent: baseCommissionRate, // decimal (0.05 = 5%)
+            basePercent: baseCommissionRate,
             graceDays,
-            penaltyPerDay, // % de la TASA por día
+            penaltyPerDay,
           },
-          amounts: {
-            expectedCommission, // si cobrara toda la cartera en término
-            totalCommission: currentCommission, // “debería cobrar” HOY, con castigo por demora
-            totalCommissionNoPenalty: totalCommissionIdeal, // referencia sin castigo
-            alreadyPaid, // ya pagado en este rango (kind=commission_payout)
-            pendingCommission, // lo lógico a pagar ahora
+          amounts: rootAmounts,
+          meta: {
+            avgEffectiveRate,
+            totalPenaltyDaysApplied,
+            paymentsBuckets: ledgerAgg?.length || 0,
           },
+        },
+        debug: {
+          collectorOid: collectorOidStr,
+          currency, // CAMBIO: sumar a debug para ver qué moneda se calculó
+          rangeStart,
+          rangeEnd,
         },
       },
     });
@@ -2618,5 +2684,430 @@ export async function getCollectorCommissionSummaryAdmin(req, res) {
       message: "Error al calcular la comisión del cobrador.",
       error: err?.message,
     });
+  }
+}
+export async function payCollectorCommissionAdmin(req, res) {
+  const session = await mongoose.startSession();
+  session.startTransaction();
+
+  try {
+    const {
+      userId, // _id Mongo del cobrador (User)
+      idCobrador, // opcional: idCobrador numérico
+      dateFrom, // opcional: YYYY-MM-DD
+      dateTo, // opcional: YYYY-MM-DD
+      amount: amountRaw, // opcional
+      currency = "ARS",
+      note = "",
+      sourceAccountCode, // opcional
+    } = req.body || {};
+
+    // ───────────────────────── Seguridad básica ─────────────────────────
+    const viewerRole = String(req.user?.role || "").trim();
+    if (!["admin", "superAdmin"].includes(viewerRole)) {
+      await session.abortTransaction();
+      return res.status(403).json({
+        ok: false,
+        message: "Solo admin / superAdmin pueden pagar comisiones.",
+      });
+    }
+
+    // ───────────────── Cuenta/usuario ejecutor ─────────────────
+    const sourceUserId = req.user?._id
+      ? new mongoose.Types.ObjectId(String(req.user._id))
+      : null;
+
+    if (!sourceUserId) {
+      await session.abortTransaction();
+      return res
+        .status(403)
+        .json({ ok: false, message: "Sesión inválida para pagar comisión." });
+    }
+
+    // ✅ FIX: nombre del ejecutor SIEMPRE por DB (req.user a veces no trae name/email)
+    const executorUser = await User.findById(sourceUserId)
+      .select("_id name email role")
+      .session(session)
+      .lean();
+
+    const executorName =
+      String(req.user?.name || req.user?.email || "").trim() ||
+      String(executorUser?.name || executorUser?.email || "").trim() ||
+      "ADMINISTRACIÓN";
+
+    // ───────────────────────── Buscar cobrador ─────────────────────────
+    let collectorUser = null;
+
+    if (userId && isObjectIdLike(userId)) {
+      collectorUser = await User.findById(userId)
+        .select(
+          "_id name email role idCobrador porcentajeCobrador commissionGraceDays commissionPenaltyPerDay"
+        )
+        .session(session)
+        .lean();
+    } else if (idCobrador != null) {
+      const idCobStr = String(idCobrador);
+      collectorUser = await User.findOne({
+        role: "cobrador",
+        idCobrador: idCobStr,
+      })
+        .select(
+          "_id name email role idCobrador porcentajeCobrador commissionGraceDays commissionPenaltyPerDay"
+        )
+        .session(session)
+        .lean();
+    }
+
+    if (!collectorUser) {
+      await session.abortTransaction();
+      return res.status(404).json({
+        ok: false,
+        message: "No se encontró el cobrador indicado.",
+      });
+    }
+
+    if (String(collectorUser.role || "") !== "cobrador") {
+      await session.abortTransaction();
+      return res.status(400).json({
+        ok: false,
+        message: "El usuario indicado no es cobrador.",
+      });
+    }
+
+    const collectorOid = new mongoose.Types.ObjectId(String(collectorUser._id));
+
+    const myCollectorId = Number(collectorUser.idCobrador);
+    if (!Number.isFinite(myCollectorId) || myCollectorId <= 0) {
+      await session.abortTransaction();
+      return res.status(400).json({
+        ok: false,
+        message: "El cobrador no tiene un idCobrador numérico válido.",
+      });
+    }
+
+    const collectorDisplayName =
+      String(collectorUser.name || collectorUser.email || "").trim() ||
+      `Cobrador #${myCollectorId}`;
+
+    // ─────────────────────── Rango de fechas / período ───────────────────────
+    const now = new Date();
+
+    let rangeStart = normalizeDateStart(dateFrom);
+    let rangeEnd = normalizeDateEnd(dateTo);
+
+    if (!rangeStart || !rangeEnd) {
+      const yearNow = now.getFullYear();
+      const monthNow = now.getMonth();
+      rangeStart = new Date(yearNow, monthNow, 1, 0, 0, 0, 0);
+      rangeEnd = new Date(yearNow, monthNow + 1, 0, 23, 59, 59, 999);
+    }
+
+    const period = yyyymmAR(rangeStart); // "YYYY-MM"
+
+    // ───────────────── Config de comisión (User) ─────────────────
+    let baseCommissionRate = 0; // decimal
+
+    const rawPercent = collectorUser.porcentajeCobrador;
+    if (typeof rawPercent === "number" && rawPercent > 0) {
+      baseCommissionRate = rawPercent <= 1 ? rawPercent : rawPercent / 100;
+    }
+
+    if (!baseCommissionRate) {
+      await session.abortTransaction();
+      return res.status(409).json({
+        ok: false,
+        message:
+          "El cobrador no tiene porcentaje de comisión configurado (> 0).",
+      });
+    }
+
+    // ───────────────── Base real de comisión (NUEVA lógica) ─────────────────
+    const ledgerAgg = await LedgerEntry.aggregate([
+      {
+        $match: {
+          accountCode: "CAJA_COBRADOR",
+          side: "debit",
+          userId: collectorOid,
+          "dimensions.idCliente": { $exists: true, $ne: null },
+          postedAt: { $gte: rangeStart, $lte: rangeEnd },
+          currency,
+        },
+      },
+      { $group: { _id: null, totalCollected: { $sum: "$amount" } } },
+    ])
+      .session(session)
+      .allowDiskUse(true);
+
+    const totalCollectedThisPeriod = Number(
+      ledgerAgg?.[0]?.totalCollected || 0
+    );
+    const totalCommission = totalCollectedThisPeriod * baseCommissionRate;
+
+    if (!Number.isFinite(totalCommission) || totalCommission <= 0) {
+      await session.abortTransaction();
+      return res.status(409).json({
+        ok: false,
+        message:
+          "No hay base de cobros del cobrador para calcular comisión en este período.",
+        details: {
+          totalCollectedThisPeriod,
+          commissionRate: baseCommissionRate,
+        },
+      });
+    }
+
+    // ───────────────── Lo ya pagado como comisión (NUEVA lógica) ─────────────────
+    // ✅ usamos kind ROOT (no dimensions.kind)
+    const paidAgg = await LedgerEntry.aggregate([
+      {
+        $match: {
+          accountCode: "COMISION_COBRADOR",
+          side: "debit",
+          userId: collectorOid,
+          kind: "commission_payout",
+          postedAt: { $gte: rangeStart, $lte: rangeEnd },
+          currency,
+        },
+      },
+      { $group: { _id: null, totalPaid: { $sum: "$amount" } } },
+    ])
+      .session(session)
+      .allowDiskUse(true);
+
+    const alreadyPaid = Number(paidAgg?.[0]?.totalPaid || 0);
+    const pendingCommission = Math.max(totalCommission - alreadyPaid, 0);
+
+    if (pendingCommission <= 0) {
+      await session.abortTransaction();
+      return res.status(409).json({
+        ok: false,
+        message: "No hay comisión pendiente para pagar en el período indicado.",
+        details: { totalCommission, alreadyPaid },
+      });
+    }
+
+    // ───────────────── Cuánto pagar ahora ─────────────────
+    let payNow = Number(amountRaw);
+    const payAll =
+      !Number.isFinite(payNow) || payNow <= 0 || payNow >= pendingCommission;
+
+    if (payAll) payNow = pendingCommission;
+    payNow = Number(payNow);
+
+    if (!Number.isFinite(payNow) || payNow <= 0) {
+      await session.abortTransaction();
+      return res.status(400).json({
+        ok: false,
+        message: "Monto inválido para pagar comisión.",
+      });
+    }
+
+    // ───────────────── Cuenta origen (admin/superAdmin) ─────────────────
+    const allowedForAdmin = ["CAJA_ADMIN", "CAJA_CHICA"];
+    const allowedForSuper = ["CAJA_CHICA", "CAJA_GRANDE", "CAJA_ADMIN"];
+
+    const defaultSourceAccount =
+      viewerRole === "superAdmin" ? "CAJA_GRANDE" : "CAJA_ADMIN";
+
+    let fromAccount = String(sourceAccountCode || defaultSourceAccount).trim();
+    const allowedAccounts =
+      viewerRole === "superAdmin" ? allowedForSuper : allowedForAdmin;
+
+    if (!allowedAccounts.includes(fromAccount)) {
+      fromAccount = defaultSourceAccount;
+    }
+
+    // Chequeo de saldo en cuenta origen
+    const sourceBalance = await getBalance({
+      userId: sourceUserId,
+      accountCode: fromAccount,
+      currency,
+    });
+
+    if (Number(sourceBalance || 0) + 1e-6 < payNow) {
+      await session.abortTransaction();
+      return res.status(409).json({
+        ok: false,
+        message:
+          "Saldo insuficiente en la cuenta origen para pagar la comisión.",
+        available: sourceBalance,
+        requested: payNow,
+      });
+    }
+
+    // ───────────────── Asiento ledger (NEW ONLY) + idempotencia ─────────────────
+    const postedAt = new Date();
+    const amtAbs = Math.abs(Number(payNow) || 0);
+
+    // ✅ idempotencia determinística por scope del pago
+    const idemKey = `commission_payout:${String(
+      collectorUser._id
+    )}:${period}:${fromAccount}:${currency}:${amtAbs}`;
+
+    // ✅ FIX: idempotencia por paymentId (no por note)
+    // Buscamos cualquier asiento previo que tenga EXACTAMENTE este idemKey.
+    // Como no tenemos campo idemKey en schema, lo guardamos dentro de dimensions.note con prefijo estable.
+    const cleanNote = String(note || "").trim();
+    const noteFinal = cleanNote ? `${cleanNote} | ${idemKey}` : idemKey;
+
+    const dup = await LedgerEntry.findOne(
+      {
+        kind: "commission_payout",
+        currency,
+        // buscamos por dims.note exacto para evitar falsos positivos
+        "dimensions.note": noteFinal,
+      },
+      { _id: 1, paymentId: 1 }
+    )
+      .session(session)
+      .lean();
+
+    let transferResult = null;
+    let paidNowReal = amtAbs;
+
+    if (dup) {
+      // duplicado → no creamos nada
+      paidNowReal = 0;
+      transferResult = {
+        ok: true,
+        skipped: true,
+        paymentId: dup.paymentId || null,
+        entryIds: [dup._id],
+        idemKey,
+      };
+    } else {
+      const payoutId = new mongoose.Types.ObjectId();
+
+      const dims = {
+        idCobrador: myCollectorId,
+        idCliente: null,
+        plan: null,
+        canal: "COMMISSION_PAYOUT",
+        note: noteFinal,
+      };
+
+      // ✅ CAMBIO: userId por línea = dueño de la cuenta afectada
+      // - DEBIT suma COMISION_COBRADOR al cobrador (userId=cobrador)
+      // - CREDIT resta fromAccount al admin/super (userId=admin/super)
+
+      const debitDoc = {
+        paymentId: payoutId,
+        userId: collectorOid,
+        kind: "commission_payout",
+        side: "debit",
+        accountCode: "COMISION_COBRADOR",
+        amount: amtAbs,
+        currency,
+        postedAt,
+
+        // origen → destino
+        fromUser: executorName,
+        toUser: collectorDisplayName,
+        fromAccountCode: fromAccount,
+        toAccountCode: "COMISION_COBRADOR",
+
+        dimensions: dims,
+      };
+
+      const creditDoc = {
+        paymentId: payoutId,
+        userId: sourceUserId,
+        kind: "commission_payout",
+        side: "credit",
+        accountCode: fromAccount,
+        amount: amtAbs,
+        currency,
+        postedAt,
+
+        // inverso para UI
+        fromUser: collectorDisplayName,
+        toUser: executorName,
+        fromAccountCode: "COMISION_COBRADOR",
+        toAccountCode: fromAccount,
+
+        dimensions: dims,
+      };
+
+      const docs = await LedgerEntry.insertMany([debitDoc, creditDoc], {
+        session,
+        ordered: true,
+      });
+
+      transferResult = {
+        ok: true,
+        skipped: false,
+        paymentId: payoutId,
+        entryIds: docs.map((d) => d._id),
+        idemKey,
+      };
+    }
+
+    const newAlreadyPaid = alreadyPaid + paidNowReal;
+    const pendingAfter = Math.max(totalCommission - newAlreadyPaid, 0);
+
+    await session.commitTransaction();
+
+    return res.status(201).json({
+      ok: true,
+      message: transferResult?.skipped
+        ? "Pago duplicado detectado (idempotencia): no se creó un nuevo asiento."
+        : "Comisión abonada al cobrador.",
+      data: {
+        collector: {
+          userId: collectorUser._id,
+          idCobrador: myCollectorId,
+          name: collectorUser.name || null,
+          email: collectorUser.email || null,
+        },
+        period,
+        range: { from: rangeStart, to: rangeEnd },
+        amounts: {
+          totalCommission,
+          totalCommissionNoPenalty: totalCommission,
+          alreadyPaidBefore: alreadyPaid,
+          paidNow: paidNowReal,
+          alreadyPaidAfter: newAlreadyPaid,
+          pendingAfter,
+        },
+        commissions: {
+          config: { basePercent: baseCommissionRate },
+          amounts: {
+            totalCommission,
+            totalCommissionNoPenalty: totalCommission,
+            alreadyPaid: newAlreadyPaid,
+            pendingCommission: pendingAfter,
+          },
+        },
+        ledger: transferResult,
+        source: {
+          userId: sourceUserId,
+          accountCode: fromAccount,
+          balanceBefore: sourceBalance,
+          balanceAfter: Number(sourceBalance || 0) - paidNowReal,
+        },
+        executedBy: {
+          userId: sourceUserId,
+          name: executorName,
+        },
+        meta: {
+          payAll: payAll ? 1 : 0,
+          requestedAmount: Number.isFinite(Number(amountRaw))
+            ? Number(amountRaw)
+            : null,
+        },
+      },
+    });
+  } catch (err) {
+    try {
+      await session.abortTransaction();
+    } catch {}
+    console.error("payCollectorCommissionAdmin error:", err);
+    return res.status(500).json({
+      ok: false,
+      message: "Error al pagar la comisión del cobrador.",
+      error: err?.message,
+    });
+  } finally {
+    session.endSession();
   }
 }

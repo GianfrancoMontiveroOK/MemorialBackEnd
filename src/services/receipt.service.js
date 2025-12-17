@@ -25,7 +25,7 @@ const {
   RECEIPT_PADDING = "7",
   RECEIPT_HMAC_SECRET = "",
   COMPANY_NAME = "Memorial S.A.",
-  COMPANY_ADDRESS = "Av. Siempreviva 123, San Rafael, Mendoza",
+  COMPANY_ADDRESS = "Av. El Libertador 329, San Rafael, Mendoza",
   COMPANY_TAX_ID = "CUIT 30-12345678-9",
 } = process.env;
 

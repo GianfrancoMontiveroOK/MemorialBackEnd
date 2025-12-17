@@ -38,6 +38,7 @@ app.set("trust proxy", 1);
 
 // 🔗 Orígenes permitidos
 const ALLOWED_ORIGINS = [
+  "http://127.0.0.1:3000",
   "http://localhost:3000",
   "http://localhost:3001",
   "https://www.memorialsanrafael.com.ar",

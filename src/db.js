@@ -4,7 +4,7 @@ import mongoose from "mongoose";
 // Servicios de pricing
 import {
   recomputeAllGroups,        // orquestador (todos)
-} from "./services/pricing.services.js";
+} from "./controllers/admin.reprice.controller.js";
 
 import { getGlobalPriceRules } from "./services/priceRules.provider.js";
 

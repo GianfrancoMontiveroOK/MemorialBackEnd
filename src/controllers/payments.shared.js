@@ -1,4 +1,4 @@
-// src/controllers/collector.shared.js
+// src/controllers/payments.shared.js
 import mongoose from "mongoose";
 
 /* ============ Helpers genéricos ============ */

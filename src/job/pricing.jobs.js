@@ -4,7 +4,7 @@ import { getGlobalPriceRules } from "../services/priceRules.provider.js";
 import {
   recomputeAllGroups,
   fixAgesAndMaybeReprice,
-} from "../services/pricing.services.js";
+} from "../controllers/admin.reprice.controller.js";
 
 /**
  * ⏰ Programa el reproceso diario de precios (cuotaIdeal) para TODOS los grupos.
@@ -122,8 +122,10 @@ export async function fixZeroPricing({
   }
 
   const ids = rows.map((r) => r.idCliente);
+
+  // 👇 ahora tomamos recomputeGroupsByIds desde el controller (no desde el service lite)
   const { recomputeGroupsByIds } = await import(
-    "../services/pricing.services.js"
+    "../controllers/admin.reprice.controller.js"
   );
 
   const r = await recomputeGroupsByIds(ids, {

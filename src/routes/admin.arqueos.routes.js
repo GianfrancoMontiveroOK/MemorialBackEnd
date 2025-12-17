@@ -21,6 +21,9 @@ import {
 
   // ➕ NUEVO: resumen de comisiones de un cobrador (para admin)
   getCollectorCommissionSummaryAdmin,
+
+  // ➕ NUEVO: pago de comisión al cobrador
+  payCollectorCommissionAdmin,
 } from "../controllers/admin-arqueos.controller.js";
 
 const router = Router();
@@ -97,6 +100,26 @@ router.get(
   requireSession,
   adminOnly,
   getCollectorCommissionSummaryAdmin
+);
+
+/**
+ * Pago de comisión al cobrador
+ *
+ * POST /api/admin/arqueos/pagar-comision
+ *
+ * Body:
+ *  - userId | idCobrador
+ *  - dateFrom, dateTo        (si faltan, usa mes actual)
+ *  - amount                  (opcional; si no se manda o es >= pendiente, paga todo)
+ *  - currency                (default "ARS")
+ *  - note                    (opcional)
+ *  - sourceAccountCode       (opcional: admin → CAJA_ADMIN/CAJA_CHICA, SA → CAJA_GRANDE/CAJA_CHICA)
+ */
+router.post(
+  "/admin/arqueos/pagar-comision",
+  requireSession,
+  adminOnly, // permite admin y superAdmin
+  payCollectorCommissionAdmin
 );
 
 /* =========================================================================
