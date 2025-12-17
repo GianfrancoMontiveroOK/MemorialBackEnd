@@ -55,11 +55,17 @@ export async function getClientPeriodState(clienteDoc, opts = {}) {
     ? Math.max(0, opts.includeFuture)
     : 1;
 
-  // 1) Primer período facturable global del sistema
-  const billableFrom = GO_LIVE_PERIOD; // ej: "2025-10"
+  // 1) Primer período facturable del cliente
+  // SUPOSICIÓN: se cobra desde el mes del createdAt (inclusive)
+  const createdAtP = clienteDoc?.createdAt
+    ? toYYYYMM(clienteDoc.createdAt)
+    : null;
+
+  // si no hay createdAt (docs viejos importados), caemos al go-live global
+  const billableFrom = maxPeriod(GO_LIVE_PERIOD, createdAtP || GO_LIVE_PERIOD);
 
   // 2) Ventana solicitada (clamp)
-  //    from nunca puede ser menor a GO_LIVE_PERIOD
+  //    from nunca puede ser menor al billableFrom (cliente)
   const requestedFrom = opts.from || billableFrom;
   const baseFrom = maxPeriod(requestedFrom, billableFrom);
 

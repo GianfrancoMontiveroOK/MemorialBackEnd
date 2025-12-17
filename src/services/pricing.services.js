@@ -57,7 +57,6 @@ export async function computeCuotaIdealAsync({
     rules
   );
 }
-
 /* ============================================================================
    HELPERS DB internos
    ========================================================================== */
@@ -227,8 +226,6 @@ async function updateAgesForGroup(filter, { debug = false } = {}) {
   }
   return res;
 }
-
-
 /* ============================================================================
    Núcleo: recalcular y PERSISTIR todo el grupo
    ========================================================================== */
@@ -345,7 +342,6 @@ export async function recomputeGroupPricing(
     titularModified,
   };
 }
-
 export default {
   round500,
   membersFactor,

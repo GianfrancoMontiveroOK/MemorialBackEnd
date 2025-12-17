@@ -10,6 +10,51 @@ const toObjectId = (v) =>
 const SAFE_SELECT =
   "email name role emailVerified idCobrador idVendedor createdAt updatedAt porcentajeCobrador commissionGraceDays commissionPenaltyPerDay";
 
+/** ================== Revocar sesiones (MongoStore) ==================
+ * Borra docs de la colección donde connect-mongo guarda las sesiones.
+ * Default: collectionName: "sessionMemorial"
+ */
+const SESSIONS_COLLECTION = process.env.SESSION_COLLECTION || "sessionMemorial";
+
+/**
+ * Revoca sesiones del usuario borrando docs de MongoStore.
+ * Importante: depende de qué guardás en req.session.
+ * Probamos varios paths comunes (Memorial + Passport-style).
+ */
+async function revokeUserSessions({ userId, email }) {
+  try {
+    const db = mongoose.connection?.db;
+    if (!db) return { deletedCount: 0 };
+
+    const col = db.collection(SESSIONS_COLLECTION);
+
+    const uid = userId ? String(userId) : null;
+    const em = email ? String(email).trim().toLowerCase() : null;
+
+    const or = [];
+    if (uid) {
+      or.push(
+        { "session.user._id": uid },
+        { "session.user.id": uid },
+        { "session.userId": uid },
+        { "session.passport.user": uid }
+      );
+    }
+    if (em) {
+      or.push({ "session.user.email": em }, { "session.email": em });
+    }
+
+    if (!or.length) return { deletedCount: 0 };
+
+    const r = await col.deleteMany({ $or: or });
+    return { deletedCount: r?.deletedCount || 0 };
+  } catch (e) {
+    // No frenamos el update por esto. Solo avisamos.
+    console.warn("[revokeUserSessions] warn:", e?.message || e);
+    return { deletedCount: 0 };
+  }
+}
+
 /** Normaliza un rol a la forma EXACTA del enum del modelo */
 const ALLOWED_ROLES = [
   "superAdmin",
@@ -190,6 +235,9 @@ export const updateUser = async (req, res) => {
         .status(404)
         .json({ ok: false, message: "Usuario no encontrado" });
 
+    // ✅ si cambiaste cosas sensibles (emailVerified / email), revocamos sesiones
+    await revokeUserSessions({ userId: String(id), email: updated?.email });
+
     return res.json({ ok: true, item: updated });
   } catch (err) {
     console.error("updateUser error:", err);
@@ -226,7 +274,9 @@ export const setUserRole = async (req, res) => {
     }
 
     // --- Cargar usuario destino (para validar reglas por rol)
-    const target = await User.findById(targetId).select("_id role").lean();
+    const target = await User.findById(targetId)
+      .select("_id role email")
+      .lean();
     if (!target) {
       return res
         .status(404)
@@ -273,6 +323,12 @@ export const setUserRole = async (req, res) => {
       .select(SAFE_SELECT)
       .lean();
 
+    // ✅ revocar sesiones del usuario modificado
+    await revokeUserSessions({
+      userId: targetId.toString(),
+      email: target.email,
+    });
+
     return res.json({ ok: true, item: updated });
   } catch (err) {
     console.error("setUserRole error:", err);
@@ -309,7 +365,9 @@ export const setUserCobrador = async (req, res, next) => {
 
     // Cargar usuario destino
     const targetId = new mongoose.Types.ObjectId(String(id));
-    const target = await User.findById(targetId).select("_id role").lean();
+    const target = await User.findById(targetId)
+      .select("_id role email")
+      .lean();
     if (!target) {
       return res
         .status(404)
@@ -352,6 +410,12 @@ export const setUserCobrador = async (req, res, next) => {
       .select(SAFE_SELECT)
       .lean();
 
+    // ✅ revocar sesiones del usuario modificado
+    await revokeUserSessions({
+      userId: targetId.toString(),
+      email: target.email,
+    });
+
     return res.json({ ok: true, item: updated });
   } catch (err) {
     next(err);
@@ -387,7 +451,9 @@ export const setUserVendedor = async (req, res, next) => {
 
     // Cargar usuario destino
     const targetId = new mongoose.Types.ObjectId(String(id));
-    const target = await User.findById(targetId).select("_id role").lean();
+    const target = await User.findById(targetId)
+      .select("_id role email")
+      .lean();
     if (!target) {
       return res
         .status(404)
@@ -430,6 +496,12 @@ export const setUserVendedor = async (req, res, next) => {
       .select(SAFE_SELECT)
       .lean();
 
+    // ✅ revocar sesiones del usuario modificado
+    await revokeUserSessions({
+      userId: targetId.toString(),
+      email: target.email,
+    });
+
     return res.json({ ok: true, item: updated });
   } catch (err) {
     next(err);
@@ -455,6 +527,14 @@ export const setCollectorCommission = async (req, res) => {
       return res
         .status(400)
         .json({ ok: false, message: "ID de usuario inválido." });
+    }
+
+    // Traemos email para revocar sesiones de forma robusta
+    const target = await User.findById(id).select("_id email").lean();
+    if (!target) {
+      return res
+        .status(404)
+        .json({ ok: false, message: "Usuario no encontrado." });
     }
 
     const update = {};
@@ -484,11 +564,8 @@ export const setCollectorCommission = async (req, res) => {
       runValidators: true,
     }).lean();
 
-    if (!updated) {
-      return res
-        .status(404)
-        .json({ ok: false, message: "Usuario no encontrado." });
-    }
+    // ✅ revocar sesiones del usuario modificado
+    await revokeUserSessions({ userId: String(id), email: target.email });
 
     return res.json({
       ok: true,
@@ -515,6 +592,14 @@ export const setCollectorCommissionGraceDays = async (req, res) => {
         .json({ ok: false, message: "ID de usuario inválido." });
     }
 
+    // Traemos email para revocar sesiones de forma robusta
+    const target = await User.findById(id).select("_id email").lean();
+    if (!target) {
+      return res
+        .status(404)
+        .json({ ok: false, message: "Usuario no encontrado." });
+    }
+
     const update = {};
 
     if (graceDays === "" || graceDays === null || graceDays === undefined) {
@@ -534,6 +619,9 @@ export const setCollectorCommissionGraceDays = async (req, res) => {
       new: true,
       runValidators: true,
     }).lean();
+
+    // ✅ revocar sesiones del usuario modificado
+    await revokeUserSessions({ userId: String(id), email: target.email });
 
     if (!updated) {
       return res
@@ -563,6 +651,14 @@ export const setCollectorCommissionPenaltyPerDay = async (req, res) => {
         .json({ ok: false, message: "ID de usuario inválido." });
     }
 
+    // Traemos email para revocar sesiones de forma robusta
+    const target = await User.findById(id).select("_id email").lean();
+    if (!target) {
+      return res
+        .status(404)
+        .json({ ok: false, message: "Usuario no encontrado." });
+    }
+
     const update = {};
 
     if (
@@ -586,6 +682,9 @@ export const setCollectorCommissionPenaltyPerDay = async (req, res) => {
       new: true,
       runValidators: true,
     }).lean();
+
+    // ✅ revocar sesiones del usuario modificado
+    await revokeUserSessions({ userId: String(id), email: target.email });
 
     if (!updated) {
       return res
