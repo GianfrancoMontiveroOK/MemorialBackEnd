@@ -147,7 +147,10 @@ export async function listArqueosUsuarios(req, res, next) {
     const limit = Math.max(Math.min(toInt(req.query.limit || 25, 25), 200), 1);
 
     const q = String(req.query.q || "").trim();
-    const roleFilter = String(req.query.role || "").trim();
+    const qLower = q.toLowerCase();
+
+    const roleFilter = String(req.query.role || "").trim(); // "admin"|"superAdmin"|"cobrador"|"global"
+    const onlyGlobals = roleFilter === "global";
 
     const sortByParam = String(req.query.sortBy || "totalBalance");
     const sortDirParam = toDir(req.query.sortDir || "desc");
@@ -174,13 +177,14 @@ export async function listArqueosUsuarios(req, res, next) {
     const fromDt = parseISODate(req.query.dateFrom);
     const toDt = parseISODate(req.query.dateTo, true);
 
+    // ───────────────────────── Usuarios a listar ─────────────────────────
     const userMatch = { role: { $in: ALLOWED_BY_VIEWER } };
 
-    if (roleFilter && ALLOWED_BY_VIEWER.includes(roleFilter)) {
+    if (!onlyGlobals && roleFilter && ALLOWED_BY_VIEWER.includes(roleFilter)) {
       userMatch.role = roleFilter;
     }
 
-    if (q) {
+    if (!onlyGlobals && q) {
       const oid = asObjectId(q);
       userMatch.$or = [
         { name: { $regex: q, $options: "i" } },
@@ -189,14 +193,11 @@ export async function listArqueosUsuarios(req, res, next) {
       ];
     }
 
-    // ✅ IMPORTANTE: como ya corregiste los controllers,
-    // ✅ toUser SIEMPRE ES EL DUEÑO DE LA LÍNEA.
-    // => arqueos por usuario: match por toUser (normalizado)
-
-    const base = [
+    // ───────────────────────── Pipeline usuarios ─────────────────────────
+    const baseUsers = [
       { $match: userMatch },
 
-      // aliases del usuario (lowercase) para matchear toUser
+      // ✅ aliases del usuario (lowercase) + labels legacy típicos
       {
         $addFields: {
           __aliasesLower: {
@@ -205,7 +206,6 @@ export async function listArqueosUsuarios(req, res, next) {
                 $filter: {
                   input: {
                     $setUnion: [
-                      // name + email
                       [
                         {
                           $toLower: {
@@ -218,8 +218,6 @@ export async function listArqueosUsuarios(req, res, next) {
                           },
                         },
                       ],
-
-                      // cobrador #id
                       [
                         {
                           $cond: [
@@ -241,8 +239,6 @@ export async function listArqueosUsuarios(req, res, next) {
                           ],
                         },
                       ],
-
-                      // labels legacy típicos (por si quedaron movimientos viejos)
                       [
                         { $cond: [{ $eq: ["$role", "admin"] }, "admin", ""] },
                         {
@@ -260,9 +256,12 @@ export async function listArqueosUsuarios(req, res, next) {
                           ],
                         },
                         {
-                          $cond: [{ $eq: ["$role", "admin"] }, "caja_admin", ""],
+                          $cond: [
+                            { $eq: ["$role", "admin"] },
+                            "caja_admin",
+                            "",
+                          ],
                         },
-
                         {
                           $cond: [
                             { $eq: ["$role", "superAdmin"] },
@@ -304,10 +303,21 @@ export async function listArqueosUsuarios(req, res, next) {
           pipeline: [
             {
               $addFields: {
-                __toLower: {
-                  $toLower: {
-                    $trim: { input: { $ifNull: ["$toUser", ""] } },
-                  },
+                // ✅ owner dinámico: debit->toUser | credit->fromUser
+                __ownerLower: {
+                  $cond: [
+                    { $eq: ["$side", "credit"] },
+                    {
+                      $toLower: {
+                        $trim: { input: { $ifNull: ["$fromUser", ""] } },
+                      },
+                    },
+                    {
+                      $toLower: {
+                        $trim: { input: { $ifNull: ["$toUser", ""] } },
+                      },
+                    },
+                  ],
                 },
               },
             },
@@ -315,7 +325,7 @@ export async function listArqueosUsuarios(req, res, next) {
               $match: {
                 $expr: {
                   $and: [
-                    // 1) cuentas permitidas por rol (o override)
+                    // 1) cuentas permitidas
                     {
                       $in: [
                         "$accountCode",
@@ -337,8 +347,8 @@ export async function listArqueosUsuarios(req, res, next) {
                       ],
                     },
 
-                    // 2) dueño = toUser
-                    { $in: ["$__toLower", "$$aliasesLower"] },
+                    // 2) dueño por ownerLower
+                    { $in: ["$__ownerLower", "$$aliasesLower"] },
 
                     // 3) rango postedAt
                     ...(fromDt || toDt
@@ -439,23 +449,205 @@ export async function listArqueosUsuarios(req, res, next) {
     const sortBy = SORTABLE.has(sortByParam) ? sortByParam : "totalBalance";
     const sortStage = { $sort: { [sortBy]: sortDirParam, _id: sortDirParam } };
 
-    const dataPipeline = [...base, sortStage];
-    const countPipeline = [{ $match: userMatch }, { $count: "n" }];
+    let realItems = [];
+    let totalReal = 0;
 
-    const [realItems, countRes] = await Promise.all([
-      User.aggregate(dataPipeline).allowDiskUse(true),
-      User.aggregate(countPipeline).allowDiskUse(true),
-    ]);
+    if (!onlyGlobals) {
+      const dataPipeline = [...baseUsers, sortStage];
+      const countPipeline = [{ $match: userMatch }, { $count: "n" }];
 
-    const total = countRes?.[0]?.n || 0;
+      const [itemsAgg, countRes] = await Promise.all([
+        User.aggregate(dataPipeline).allowDiskUse(true),
+        User.aggregate(countPipeline).allowDiskUse(true),
+      ]);
+
+      realItems = itemsAgg || [];
+      totalReal = countRes?.[0]?.n || 0;
+    }
+
+    // ───────────────────────── Globals: cajas físicas / bancos ─────────────────────────
+    // ✅ Solo superAdmin (si querés que admin también las vea, lo cambiamos)
+    let globals = [];
+    if (viewerRole === "superAdmin") {
+      // ✅ lista fija (SIEMPRE deben existir)
+      const GLOBAL_KEYS = [
+        "caja_chica",
+        "caja_grande",
+        "banco_nacion",
+        "tarjeta_naranja",
+      ];
+
+      // (opcional) si querés que siempre muestre al menos ARS
+      const DEFAULT_CURRENCIES = ["ARS"];
+
+      const globalMatch = {
+        ...(fromDt || toDt
+          ? {
+              postedAt: {
+                ...(fromDt ? { $gte: fromDt } : {}),
+                ...(toDt ? { $lte: toDt } : {}),
+              },
+            }
+          : {}),
+      };
+
+      const globalAgg = await LedgerEntry.aggregate([
+        { $match: globalMatch },
+        {
+          $addFields: {
+            __ownerLower: {
+              $cond: [
+                { $eq: ["$side", "credit"] },
+                {
+                  $toLower: {
+                    $trim: { input: { $ifNull: ["$fromUser", ""] } },
+                  },
+                },
+                {
+                  $toLower: { $trim: { input: { $ifNull: ["$toUser", ""] } } },
+                },
+              ],
+            },
+          },
+        },
+        { $match: { __ownerLower: { $in: GLOBAL_KEYS } } },
+        {
+          $group: {
+            _id: { owner: "$__ownerLower", currency: "$currency" },
+            debits: {
+              $sum: {
+                $cond: [
+                  { $eq: ["$side", "debit"] },
+                  { $ifNull: ["$amount", 0] },
+                  0,
+                ],
+              },
+            },
+            credits: {
+              $sum: {
+                $cond: [
+                  { $eq: ["$side", "credit"] },
+                  { $ifNull: ["$amount", 0] },
+                  0,
+                ],
+              },
+            },
+            lastMovementAt: { $max: "$postedAt" },
+            paymentsSet: { $addToSet: "$paymentId" },
+          },
+        },
+        {
+          $project: {
+            _id: 0,
+            owner: "$_id.owner",
+            currency: "$_id.currency",
+            debits: 1,
+            credits: 1,
+            balance: { $subtract: ["$debits", "$credits"] },
+            lastMovementAt: 1,
+            paymentsCount: { $size: "$paymentsSet" },
+          },
+        },
+        {
+          $group: {
+            _id: "$owner",
+            boxes: {
+              $push: {
+                currency: "$currency",
+                debits: "$debits",
+                credits: "$credits",
+                balance: "$balance",
+                lastMovementAt: "$lastMovementAt",
+                paymentsCount: "$paymentsCount",
+              },
+            },
+            totalBalance: { $sum: "$balance" },
+            lastMovementAt: { $max: "$lastMovementAt" },
+            paymentsCount: { $sum: "$paymentsCount" },
+          },
+        },
+        {
+          $project: {
+            _id: 0,
+            key: "$_id",
+            boxes: 1,
+            totalBalance: 1,
+            lastMovementAt: 1,
+            paymentsCount: 1,
+          },
+        },
+      ]).allowDiskUse(true);
+
+      // ✅ indexar resultados reales
+      const byKey = new Map((globalAgg || []).map((g) => [String(g.key), g]));
+
+      // ✅ seed fijo en 0 + override si hay datos
+      globals = GLOBAL_KEYS.map((k) => {
+        const got = byKey.get(k);
+
+        const boxes = got?.boxes?.length
+          ? got.boxes
+          : DEFAULT_CURRENCIES.map((c) => ({
+              currency: c,
+              debits: 0,
+              credits: 0,
+              balance: 0,
+              lastMovementAt: null,
+              paymentsCount: 0,
+            }));
+
+        const nameUpper = String(k).toUpperCase();
+
+        return {
+          _id: `GLOBAL:${nameUpper}`,
+          name: nameUpper,
+          email: null,
+          role: "global",
+          idCobrador: null,
+          boxes,
+          totalBalance: got?.totalBalance ?? 0,
+          lastMovementAt: got?.lastMovementAt ?? null,
+          paymentsCount: got?.paymentsCount ?? 0,
+        };
+      });
+
+      // ✅ aplicar filtro q también a globals (sin borrarlas por falta de movimientos)
+      if (q) {
+        globals = globals.filter((g) =>
+          String(g.name || "")
+            .toLowerCase()
+            .includes(qLower)
+        );
+      }
+    }
+
+    // ───────────────────────── Merge + paging ─────────────────────────
+    let merged = [];
+    if (onlyGlobals) merged = globals;
+    else merged = [...globals, ...realItems];
+
+    // si querés otro orden (por ejemplo globals abajo), invertí el merge
+    // merged = [...realItems, ...globals];
+
+    // (opcional) si querés ordenar el merged completo por sortBy:
+    // ojo: sortBy puede no existir igual en globals y users, pero acá existe.
+    merged.sort((a, b) => {
+      const dir = sortDirParam;
+      const va = a?.[sortBy];
+      const vb = b?.[sortBy];
+      if (va == null && vb == null) return 0;
+      if (va == null) return 1;
+      if (vb == null) return -1;
+      if (va < vb) return -1 * dir;
+      if (va > vb) return 1 * dir;
+      return 0;
+    });
+
+    const total = merged.length;
 
     const start = (page - 1) * limit;
     const end = start + limit;
-
-    const finalItems =
-      orderMode === "default"
-        ? realItems.slice(start, end)
-        : realItems.slice(start, end); // (si querés jerarquía acá, lo enchufamos después)
+    const finalItems = merged.slice(start, end);
 
     return res.json({
       ok: true,
@@ -479,14 +671,13 @@ export async function listArqueosUsuarios(req, res, next) {
         q,
         destAccountCode,
         orderMode,
-        ownerMatch: "toUser (owner of line)",
+        ownerMatch: "debit->toUser | credit->fromUser",
       },
     });
   } catch (err) {
     next(err);
   }
 }
-
 export async function getArqueoUsuarioDetalle(req, res, next) {
   try {
     const page = Math.max(toInt(req.query.page, 1), 1);
@@ -645,10 +836,14 @@ export async function getArqueoUsuarioDetalle(req, res, next) {
       .lean();
 
     if (!user) {
-      return res.status(400).json({ ok: false, message: "Usuario no encontrado" });
+      return res
+        .status(400)
+        .json({ ok: false, message: "Usuario no encontrado" });
     }
     if (!BOX_ROLES.includes(user.role)) {
-      return res.status(403).json({ ok: false, message: "Rol sin caja habilitada" });
+      return res
+        .status(403)
+        .json({ ok: false, message: "Rol sin caja habilitada" });
     }
 
     const effectiveAccounts =
@@ -661,8 +856,12 @@ export async function getArqueoUsuarioDetalle(req, res, next) {
         : DEFAULT_ACCOUNTS;
 
     const aliasesLower = [
-      String(user.name || "").trim().toLowerCase(),
-      String(user.email || "").trim().toLowerCase(),
+      String(user.name || "")
+        .trim()
+        .toLowerCase(),
+      String(user.email || "")
+        .trim()
+        .toLowerCase(),
       user.role === "cobrador" && user.idCobrador != null
         ? `cobrador #${String(user.idCobrador)}`.toLowerCase()
         : "",

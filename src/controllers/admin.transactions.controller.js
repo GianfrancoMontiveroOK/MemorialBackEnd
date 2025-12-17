@@ -522,7 +522,7 @@ async function registerAutoDebitPayment({
 
   await p.save({ session });
 
-  // 6) Ledger
+  // 6) Ledger ✅ (BANCO_NACION / TARJETA_NARANJA = cajas físicas como CAJA_CHICA)
   const debitAccount =
     assetAccountCode ||
     (source === "naranja"
@@ -531,37 +531,70 @@ async function registerAutoDebitPayment({
       ? ACCOUNTS.BANCO_NACION
       : ACCOUNTS.CAJA_COBRADOR);
 
+  const creditAccount = ACCOUNTS.INGRESOS_CUOTAS;
+
+  const amtAbs = Math.abs(Number(p.amount || 0));
+  const execOid = userId ? new mongoose.Types.ObjectId(String(userId)) : null;
+
+  // ✅ Dirección única (misma en ambas partidas):
+  // CREDIT (fromAccount) = INGRESOS_CUOTAS
+  // DEBIT  (toAccount)   = BANCO_NACION / TARJETA_NARANJA
+  const fromAccountCode = creditAccount;
+  const toAccountCode = debitAccount;
+
+  // ✅ Dueños (strings) = cajas/cuentas, NO personas
+  const fromUserLabel = creditAccount; // "INGRESOS_CUOTAS"
+  const toUserLabel = debitAccount; // "BANCO_NACION" | "TARJETA_NARANJA" | etc.
+
+  const dimsCommon = {
+    idCobrador: p.collector?.idCobrador ?? null,
+    idCliente: p.cliente?.idCliente ?? null,
+    canal: p.channel,
+    source,
+    imported: true,
+    gatewayResultCode: resultCode || null,
+    executedByUserId: execOid ? String(execOid) : null,
+  };
+
   await LedgerEntry.insertMany(
     [
+      // DEBIT: aumenta BANCO_NACION / TARJETA_NARANJA
       {
         paymentId: p._id,
-        userId: userId || null,
+        userId: execOid, // auditoría (no ownership)
+        kind: "AUTO_DEBIT_POSTED",
         side: "debit",
         accountCode: debitAccount,
-        amount: Math.abs(p.amount),
+        amount: amtAbs,
         currency: p.currency,
         postedAt,
-        dimensions: {
-          userId: new mongoose.Types.ObjectId(String(userId)),
-          idCobrador: p.collector.idCobrador,
-          idCliente: p.cliente.idCliente,
-          canal: p.channel,
-        },
+
+        fromUser: fromUserLabel, // "INGRESOS_CUOTAS"
+        toUser: toUserLabel, // "BANCO_NACION" | "TARJETA_NARANJA"
+        fromAccountCode,
+        toAccountCode,
+
+        dimensions: dimsCommon,
       },
+
+      // CREDIT: reconoce ingreso (cuotas)
       {
         paymentId: p._id,
-        userId: userId || null,
+        userId: execOid,
+        kind: "AUTO_DEBIT_POSTED",
         side: "credit",
-        accountCode: ACCOUNTS.INGRESOS_CUOTAS,
-        amount: Math.abs(p.amount),
+        accountCode: creditAccount,
+        amount: amtAbs,
         currency: p.currency,
         postedAt,
-        dimensions: {
-          userId: new mongoose.Types.ObjectId(String(userId)),
-          idCobrador: p.collector.idCobrador,
-          idCliente: p.cliente.idCliente,
-          canal: p.channel,
-        },
+
+        // ✅ misma dirección (NO invertir)
+        fromUser: fromUserLabel, // owner del credit via fromUser
+        toUser: toUserLabel,
+        fromAccountCode,
+        toAccountCode,
+
+        dimensions: dimsCommon,
       },
     ],
     { session }
