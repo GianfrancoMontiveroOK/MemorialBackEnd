@@ -214,25 +214,6 @@ export async function buildReceiptPDF(
       .stroke()
       .moveDown(0.8);
 
-    // QR
-    const qrX = 48;
-    const qrY = doc.y;
-    try {
-      doc.image(qrPng, qrX, qrY, { width: 120, height: 120 });
-    } catch {
-      doc.fontSize(8).text(JSON.stringify(qrData), { width: 200 });
-    }
-    doc
-      .fontSize(9)
-      .font("Helvetica")
-      .text(
-        "Escanee el código para validar el recibo. La firma digital (HMAC) permite verificar la integridad.",
-        qrX + 140,
-        qrY,
-        { width: 360 }
-      );
-    doc.moveDown(8);
-
     // Footer
     doc.moveDown(1.2);
     doc
