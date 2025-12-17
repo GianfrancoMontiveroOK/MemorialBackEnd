@@ -33,6 +33,14 @@ const userSchema = new mongoose.Schema(
       enum: ["admin", "user", "client", "superAdmin", "cobrador", "vendedor"], // <- agregá "client"
       default: "user",
     },
+    // dentro del schema de User
+    ui: {
+      themeMode: {
+        type: String,
+        enum: ["light", "dark"],
+        default: "dark",
+      },
+    },
 
     emailVerified: { type: Boolean, default: false },
 

@@ -7,9 +7,8 @@ import {
   verifyToken,
   confirmEmail,
   organizerOnboarding,
+  setMyPreferences, // ✅ NUEVO
 } from "../controllers/auth.controller.js";
-
-// ⬇️ si pusiste el controlador en otro archivo, importalo de ahí:
 
 import { authRequired } from "../middlewares/validateToken.js";
 import { validateSchema } from "../middlewares/validator.middleware.js";
@@ -29,6 +28,9 @@ router.get("/verify", verifyToken);
 router.get("/profile", authRequired, profile);
 
 router.get("/confirmar-email", confirmEmail);
+
+// ✅ preferencias UI (themeMode, etc.)
+router.patch("/me/preferences", authRequired, setMyPreferences);
 
 // ✅ bien: auth + validateSchema(schema) + controlador
 router.post(

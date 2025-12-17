@@ -38,11 +38,9 @@ app.set("trust proxy", 1);
 
 // 🔗 Orígenes permitidos
 const ALLOWED_ORIGINS = [
-  "http://127.0.0.1:3000",
   "http://localhost:3000",
   "http://localhost:3001",
   "https://www.memorialsanrafael.com.ar",
-  "https://curly-space-couscous-qggjwqq7xgr34g95-3000.app.github.dev",
   process.env.FRONT_ORIGIN, // opcional por .env
 ].filter(Boolean);
 

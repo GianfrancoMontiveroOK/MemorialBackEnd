@@ -1,6 +1,7 @@
 // /src/services/debt.service.js
 import Payment from "../models/payment.model.js";
 import { toYYYYMM, rangePeriods, nextPeriod } from "./periods.util.js";
+import Cliente from "../models/client.model.js";
 
 /* ================== Parámetros de facturación (MVP) ================== */
 const GO_LIVE_PERIOD = "2025-10"; // primer período facturable del sistema (igual para todos)
@@ -18,12 +19,14 @@ function getQuotaFor(clienteDoc) {
 const maxPeriod = (a, b) => (!a ? b : !b ? a : a > b ? a : b);
 const minPeriod = (a, b) => (!a ? b : !b ? a : a < b ? a : b);
 
-function clampByRange(periods, { from, to }) {
-  return periods.filter((p) => {
-    if (from && p.period < from) return false;
-    if (to && p.period > to) return false;
-    return true;
-  });
+async function ensureClientCreatedAt(clienteDoc) {
+  if (clienteDoc?.createdAt) return clienteDoc.createdAt;
+
+  const id = clienteDoc?._id;
+  if (!id) return null;
+
+  const found = await Cliente.findById(id).select("createdAt").lean();
+  return found?.createdAt || null;
 }
 
 /**
@@ -57,11 +60,10 @@ export async function getClientPeriodState(clienteDoc, opts = {}) {
 
   // 1) Primer período facturable del cliente
   // SUPOSICIÓN: se cobra desde el mes del createdAt (inclusive)
-  const createdAtP = clienteDoc?.createdAt
-    ? toYYYYMM(clienteDoc.createdAt)
-    : null;
+  const createdAt = await ensureClientCreatedAt(clienteDoc);
+  const createdAtP = createdAt ? toYYYYMM(createdAt) : null;
 
-  // si no hay createdAt (docs viejos importados), caemos al go-live global
+  // si no hay createdAt, caemos al go-live global
   const billableFrom = maxPeriod(GO_LIVE_PERIOD, createdAtP || GO_LIVE_PERIOD);
 
   // 2) Ventana solicitada (clamp)
