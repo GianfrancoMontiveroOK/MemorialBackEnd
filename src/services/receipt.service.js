@@ -1,5 +1,6 @@
 // src/services/receipt.service.js
 import fs from "fs";
+import path from "path";
 import PDFDocument from "pdfkit";
 import QRCode from "qrcode";
 import Counter from "../models/counter.model.js";
@@ -9,6 +10,8 @@ import {
   canonicalizeReceiptSignature,
 } from "../utils/crypto.util.js";
 
+const PROD_ORIGIN_STATIC = "https://www.api.memorialsanrafael.com.ar";
+
 const {
   // dónde se guardan archivos en disco (carpeta real)
   FILES_DIR = "files",
@@ -17,14 +20,14 @@ const {
   // ruta pública expuesta por Express (app.use("/files", ...))
   FILES_PUBLIC_BASE = "/files",
 
-  // ✅ Tu dominio público (en prod NO debe ser localhost)
-  SERVER_PUBLIC_ORIGIN = "https://www.api.memorialsanrafael.com.ar",
-
-  // Providers (opcionales; si no los usás, no pasa nada)
-  RENDER_EXTERNAL_URL = "",
-  RENDER_EXTERNAL_HOSTNAME = "",
-  RAILWAY_PUBLIC_DOMAIN = "",
-  VERCEL_URL = "",
+  // ✅ origen público del server (IMPORTANTÍSIMO)
+  // - si está seteado en env, se usa
+  // - si no, en prod usamos el dominio estático
+  // - si no, en dev localhost
+  SERVER_PUBLIC_ORIGIN = process.env.SERVER_PUBLIC_ORIGIN ||
+    (String(process.env.NODE_ENV || "").toLowerCase() === "production"
+      ? PROD_ORIGIN_STATIC
+      : "http://localhost:4000"),
 
   RECEIPT_PREFIX = "MEM",
   RECEIPT_PADDING = "7",
@@ -32,62 +35,8 @@ const {
   COMPANY_NAME = "Memorial S.A.",
   COMPANY_ADDRESS = "Av. El Libertador 329, San Rafael, Mendoza",
   COMPANY_TAX_ID = "CUIT 30-12345678-9",
-
-  NODE_ENV = "development",
 } = process.env;
 
-/* ---------------- origin helpers (solo para pdfUrl) ---------------- */
-function isBadOrigin(o) {
-  const s = String(o || "")
-    .toLowerCase()
-    .trim();
-  return (
-    !s ||
-    s.includes("localhost") ||
-    s.includes("127.0.0.1") ||
-    s.startsWith("http://localhost") ||
-    s.startsWith("https://localhost")
-  );
-}
-
-function normalizeOrigin(o) {
-  return String(o || "")
-    .trim()
-    .replace(/\/+$/, "");
-}
-
-// ✅ Se resuelve SIEMPRE en el service
-function resolveServerPublicOrigin() {
-  // 1) Preferido: tu dominio real (custom domain)
-  const manual = normalizeOrigin(SERVER_PUBLIC_ORIGIN);
-  if (manual && !isBadOrigin(manual)) return manual;
-
-  // 2) Render
-  const renderUrl = normalizeOrigin(RENDER_EXTERNAL_URL);
-  if (renderUrl && !isBadOrigin(renderUrl)) return renderUrl;
-  const renderHost = normalizeOrigin(RENDER_EXTERNAL_HOSTNAME);
-  if (renderHost && !isBadOrigin(renderHost)) return `https://${renderHost}`;
-
-  // 3) Railway
-  const rail = normalizeOrigin(RAILWAY_PUBLIC_DOMAIN);
-  if (rail && !isBadOrigin(rail)) return `https://${rail}`;
-
-  // 4) Vercel (viene sin protocolo)
-  const vercel = normalizeOrigin(VERCEL_URL);
-  if (vercel && !isBadOrigin(vercel)) return `https://${vercel}`;
-
-  // 5) Dev only fallback
-  if (String(NODE_ENV).toLowerCase() !== "production") {
-    return "http://localhost:4000";
-  }
-
-  // ❌ Prod: nunca devolver localhost por “default”
-  throw new Error(
-    "No se pudo resolver SERVER_PUBLIC_ORIGIN en producción. Seteá SERVER_PUBLIC_ORIGIN."
-  );
-}
-
-/* ---------------- receipt logic ---------------- */
 function getYearStr(d = new Date()) {
   return String(d.getUTCFullYear());
 }
@@ -141,6 +90,8 @@ async function generateQrPngBuffer(payloadObj) {
 /**
  * Devuelve:
  *   { pdfPath, pdfUrl, receiptNumber, qrData, signature }
+ * - pdfPath: ruta ABSOLUTA en disco (para el server)
+ * - pdfUrl:  URL ABSOLUTA pública (para el front) -> SERVER_PUBLIC_ORIGIN + FILES_PUBLIC_BASE + /receipts/<AÑO>/<NRO>.pdf
  */
 export async function buildReceiptPDF(
   payment,
@@ -167,21 +118,20 @@ export async function buildReceiptPDF(
   const year = getYearStr(at);
 
   // === Paths de salida ===
-  // Disco
-  const diskDir = joinSafe(RECEIPTS_DIR, year); // files/receipts/2025
+  // 1) Disco (carpeta real)
+  const diskDir = joinSafe(RECEIPTS_DIR, year); // p.ej. files/receipts/2025
   ensureDirp(diskDir);
   const fileName = `${receiptNumber}.pdf`;
-  const pdfPath = joinSafe(diskDir, fileName);
+  const pdfPath = joinSafe(diskDir, fileName); // ABSOLUTO en disco si RECEIPTS_DIR es absoluto
 
-  // ✅ URL pública ABSOLUTA (sin localhost en prod)
-  const origin = resolveServerPublicOrigin();
+  // 2) URL pública ABSOLUTA
   const publicPath = `${FILES_PUBLIC_BASE.replace(
     /\/+$/,
     ""
   )}/receipts/${year}/${fileName}`;
-  const pdfUrl = `${origin}${publicPath}`;
+  const pdfUrl = `${SERVER_PUBLIC_ORIGIN.replace(/\/+$/, "")}${publicPath}`;
 
-  // === Render PDF (TU DISEÑO ORIGINAL, SIN CAMBIOS) ===
+  // === Render PDF ===
   await new Promise((resolve, reject) => {
     const doc = new PDFDocument({ size: "A4", margin: 48 });
     const stream = fs.createWriteStream(pdfPath);
