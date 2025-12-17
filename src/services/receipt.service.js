@@ -1,3 +1,4 @@
+// src/services/receipt.service.js
 import fs from "fs";
 import PDFDocument from "pdfkit";
 import QRCode from "qrcode";
@@ -9,14 +10,17 @@ import {
 } from "../utils/crypto.util.js";
 
 const {
+  // dónde se guardan archivos en disco (carpeta real)
   FILES_DIR = "files",
+  // subcarpeta pública para recibos
   RECEIPTS_DIR = "files/receipts",
+  // ruta pública expuesta por Express (app.use("/files", ...))
   FILES_PUBLIC_BASE = "/files",
 
-  // ⛔️ NO default a localhost acá
-  SERVER_PUBLIC_ORIGIN = "https://www.api.memorialsanrafael.com.ar/",
+  // ✅ Tu dominio público (en prod NO debe ser localhost)
+  SERVER_PUBLIC_ORIGIN = "https://www.api.memorialsanrafael.com.ar",
 
-  // Providers (auto)
+  // Providers (opcionales; si no los usás, no pasa nada)
   RENDER_EXTERNAL_URL = "",
   RENDER_EXTERNAL_HOSTNAME = "",
   RAILWAY_PUBLIC_DOMAIN = "",
@@ -32,6 +36,7 @@ const {
   NODE_ENV = "development",
 } = process.env;
 
+/* ---------------- origin helpers (solo para pdfUrl) ---------------- */
 function isBadOrigin(o) {
   const s = String(o || "")
     .toLowerCase()
@@ -78,10 +83,11 @@ function resolveServerPublicOrigin() {
 
   // ❌ Prod: nunca devolver localhost por “default”
   throw new Error(
-    "No se pudo resolver SERVER_PUBLIC_ORIGIN en producción. Seteá SERVER_PUBLIC_ORIGIN (recomendado) o asegurate que tu provider exponga una URL pública."
+    "No se pudo resolver SERVER_PUBLIC_ORIGIN en producción. Seteá SERVER_PUBLIC_ORIGIN."
   );
 }
 
+/* ---------------- receipt logic ---------------- */
 function getYearStr(d = new Date()) {
   return String(d.getUTCFullYear());
 }
@@ -132,6 +138,10 @@ async function generateQrPngBuffer(payloadObj) {
   });
 }
 
+/**
+ * Devuelve:
+ *   { pdfPath, pdfUrl, receiptNumber, qrData, signature }
+ */
 export async function buildReceiptPDF(
   payment,
   client,
@@ -156,14 +166,14 @@ export async function buildReceiptPDF(
 
   const year = getYearStr(at);
 
+  // === Paths de salida ===
   // Disco
-  const diskDir = joinSafe(RECEIPTS_DIR, year);
+  const diskDir = joinSafe(RECEIPTS_DIR, year); // files/receipts/2025
   ensureDirp(diskDir);
-
   const fileName = `${receiptNumber}.pdf`;
   const pdfPath = joinSafe(diskDir, fileName);
 
-  // ✅ URL pública (resuelta por el service)
+  // ✅ URL pública ABSOLUTA (sin localhost en prod)
   const origin = resolveServerPublicOrigin();
   const publicPath = `${FILES_PUBLIC_BASE.replace(
     /\/+$/,
@@ -171,12 +181,118 @@ export async function buildReceiptPDF(
   )}/receipts/${year}/${fileName}`;
   const pdfUrl = `${origin}${publicPath}`;
 
+  // === Render PDF (TU DISEÑO ORIGINAL, SIN CAMBIOS) ===
   await new Promise((resolve, reject) => {
     const doc = new PDFDocument({ size: "A4", margin: 48 });
     const stream = fs.createWriteStream(pdfPath);
     doc.pipe(stream);
 
-    // ... tu render del PDF igual que antes ...
+    // Header
+    doc
+      .fontSize(18)
+      .font("Helvetica-Bold")
+      .text(COMPANY_NAME, { align: "left" });
+    doc.moveDown(0.2);
+    doc.fontSize(10).font("Helvetica").text(COMPANY_ADDRESS);
+    doc.text(COMPANY_TAX_ID);
+    doc.moveDown(0.8);
+
+    doc
+      .fontSize(12)
+      .font("Helvetica-Bold")
+      .text(`RECIBO: ${receiptNumber}`, { align: "right" });
+    doc
+      .fontSize(10)
+      .font("Helvetica")
+      .text(
+        `Fecha: ${new Date(at).toLocaleString("es-AR", {
+          timeZone: "America/Argentina/Mendoza",
+          year: "numeric",
+          month: "2-digit",
+          day: "2-digit",
+          hour: "2-digit",
+          minute: "2-digit",
+        })}`,
+        { align: "right" }
+      );
+
+    doc.moveDown(1);
+
+    // Cliente
+    doc.fontSize(12).font("Helvetica-Bold").text("Datos del Cliente");
+    doc.moveDown(0.2);
+    doc
+      .fontSize(10)
+      .font("Helvetica")
+      .text(`Nombre: ${client?.nombre || client?.name || "-"}`);
+    doc.text(`ID Cliente: ${client?.idCliente ?? "-"}`);
+    if (client?.documento) doc.text(`Documento: ${client.documento}`);
+    doc.moveDown(0.8);
+    doc
+      .moveTo(48, doc.y)
+      .lineTo(548, doc.y)
+      .strokeColor("#999")
+      .stroke()
+      .moveDown(0.8);
+
+    // Pago
+    doc.fontSize(12).font("Helvetica-Bold").text("Detalle del Pago");
+    doc.moveDown(0.2);
+    doc
+      .fontSize(10)
+      .font("Helvetica")
+      .text(`Payment ID: ${String(payment._id)}`);
+    doc.text(`Método: ${String(payment.method || "efectivo")}`);
+    doc.text(`Estado: ${String(payment.status || "posted")}`);
+    doc.text(
+      `Fecha imputación: ${
+        payment.postedAt
+          ? new Date(payment.postedAt).toLocaleString("es-AR", {
+              timeZone: "America/Argentina/Mendoza",
+            })
+          : "-"
+      }`
+    );
+    doc.text(`Monto: $ ${Number(payment.amount || 0).toFixed(2)}`);
+    if (payment?.notes) doc.text(`Notas: ${String(payment.notes)}`);
+
+    doc.moveDown(0.8);
+    doc
+      .moveTo(48, doc.y)
+      .lineTo(548, doc.y)
+      .strokeColor("#999")
+      .stroke()
+      .moveDown(0.8);
+
+    // QR
+    const qrX = 48;
+    const qrY = doc.y;
+    try {
+      doc.image(qrPng, qrX, qrY, { width: 120, height: 120 });
+    } catch {
+      doc.fontSize(8).text(JSON.stringify(qrData), { width: 200 });
+    }
+    doc
+      .fontSize(9)
+      .font("Helvetica")
+      .text(
+        "Escanee el código para validar el recibo. La firma digital (HMAC) permite verificar la integridad.",
+        qrX + 140,
+        qrY,
+        { width: 360 }
+      );
+    doc.moveDown(8);
+
+    // Footer
+    doc.moveDown(1.2);
+    doc
+      .fontSize(8)
+      .fillColor("#555")
+      .text(
+        "Este comprobante corresponde a un cobro registrado en el sistema Memorial. Cualquier alteración invalida el documento.",
+        { align: "center" }
+      );
+
     doc.end();
     stream.on("finish", resolve);
     stream.on("error", reject);
